@@ -1420,9 +1420,11 @@ class StreamManager:
 
     // ==================== WebSocket 音频播放 ====================
     const AUDIO_WS_PORT = 8002;  // WebSocket 音频端口
-    const AUDIO_BUFFER_SECONDS = 0.5;
-    const MAX_AUDIO_QUEUE_SECONDS = 1.0;
+    const AUDIO_DEBUG_VERSION = 'audio-debug-20260608-2225-stable-fps';
+    const AUDIO_GAIN = 1.0;
+    const MAX_AUDIO_QUEUE_SECONDS = 2.8;
     let audioCtx = null;           // AudioContext 实例
+    let audioScriptNode = null;     // PCM 播放节点
     let audioWs = null;             // WebSocket 连接
     let audioEnabled = false;       // 用户是否启用了音频
     let audioReconnectTimer = null; // 重连定时器
@@ -1430,18 +1432,19 @@ class StreamManager:
     let audioSampleRate = 16000;
     let audioQueue = [];
     let audioQueuedSamples = 0;
-    let nextAudioTime = 0;
-    let audioScheduleTimer = null;
+    let currentAudioChunk = null;
+    let currentAudioOffset = 0;
+    let lastAudioPeak = 0;
+    let highPassLastInput = 0;
+    let highPassLastOutput = 0;
 
     function toggleAudio() {
         if (audioEnabled) {
-            // 关闭音频
             audioEnabled = false;
             stopAudioWebSocket();
             updateAudioUI();
             showToast('音频已关闭');
         } else {
-            // 开启音频（需要用户交互才能创建 AudioContext）
             audioEnabled = true;
             startAudioPlayback();
             updateAudioUI();
@@ -1469,6 +1472,7 @@ class StreamManager:
                 audioCtx = new (window.AudioContext || window.webkitAudioContext)({
                     sampleRate: audioSampleRate
                 });
+                createAudioOutputNode();
             } catch (err) {
                 console.error('AudioContext 创建失败:', err);
                 showToast('音频初始化失败');
@@ -1478,30 +1482,81 @@ class StreamManager:
             }
         }
 
-        if (audioCtx.state === 'suspended') {
-            audioCtx.resume();
+        if (!audioScriptNode) {
+            createAudioOutputNode();
         }
 
-        nextAudioTime = Math.max(audioCtx.currentTime + 0.12, nextAudioTime);
+        if (audioCtx.state === 'suspended') {
+            audioCtx.resume().catch(function(err) {
+                console.error('[音频] AudioContext resume 失败:', err);
+            });
+        }
+
+        clearAudioQueue();
         connectAudioWebSocket();
-        startAudioScheduler();
+    }
+
+    function createAudioOutputNode() {
+        if (!audioCtx || audioScriptNode) return;
+
+        audioScriptNode = audioCtx.createScriptProcessor(2048, 0, 1);
+        audioScriptNode.onaudioprocess = function(e) {
+            var output = e.outputBuffer.getChannelData(0);
+            for (var i = 0; i < output.length; i++) {
+                if (!audioEnabled) {
+                    output[i] = 0;
+                    continue;
+                }
+
+                if (!currentAudioChunk || currentAudioOffset >= currentAudioChunk.length) {
+                    currentAudioChunk = audioQueue.shift() || null;
+                    currentAudioOffset = 0;
+                    if (currentAudioChunk) {
+                        audioQueuedSamples -= currentAudioChunk.length;
+                    }
+                }
+
+                if (currentAudioChunk) {
+                    output[i] = currentAudioChunk[currentAudioOffset++];
+                } else {
+                    output[i] = 0;
+                }
+            }
+        };
+        audioScriptNode.connect(audioCtx.destination);
+        console.log('[音频] 输出节点已创建, ctx sampleRate=', audioCtx.sampleRate);
     }
 
     function clearAudioQueue() {
         audioQueue = [];
         audioQueuedSamples = 0;
-        if (audioCtx) {
-            nextAudioTime = audioCtx.currentTime + 0.12;
-        } else {
-            nextAudioTime = 0;
+        currentAudioChunk = null;
+        currentAudioOffset = 0;
+        lastAudioPeak = 0;
+    }
+
+    function resampleIfNeeded(samples, sourceRate, targetRate) {
+        if (!targetRate || Math.abs(sourceRate - targetRate) < 1) return samples;
+
+        var ratio = targetRate / sourceRate;
+        var outLength = Math.max(1, Math.round(samples.length * ratio));
+        var out = new Float32Array(outLength);
+        for (var i = 0; i < outLength; i++) {
+            var srcPos = i / ratio;
+            var idx = Math.floor(srcPos);
+            var frac = srcPos - idx;
+            var s0 = samples[idx] || 0;
+            var s1 = samples[idx + 1] || s0;
+            out[i] = s0 + (s1 - s0) * frac;
         }
+        return out;
     }
 
     function pushAudioChunk(samples) {
         audioQueue.push(samples);
         audioQueuedSamples += samples.length;
 
-        var maxSamples = Math.floor(audioSampleRate * MAX_AUDIO_QUEUE_SECONDS);
+        var maxSamples = Math.floor((audioCtx ? audioCtx.sampleRate : audioSampleRate) * MAX_AUDIO_QUEUE_SECONDS);
         while (audioQueuedSamples > maxSamples && audioQueue.length > 1) {
             var dropped = audioQueue.shift();
             audioQueuedSamples -= dropped.length;
@@ -1521,7 +1576,7 @@ class StreamManager:
                 clearAudioQueue();
                 document.getElementById('audioStatus').textContent = '已连接';
                 document.getElementById('audioStatus').className = 'audio-status connected';
-                console.log('[音频] WebSocket 已连接');
+                console.log('[音频] WebSocket 已连接', AUDIO_DEBUG_VERSION);
             };
 
             audioWs.onmessage = function(event) {
@@ -1539,12 +1594,33 @@ class StreamManager:
                 try {
                     var int16Array = new Int16Array(event.data);
                     var float32 = new Float32Array(int16Array.length);
+                    var peak = 0;
                     for (var i = 0; i < int16Array.length; i++) {
-                        float32[i] = int16Array[i] / 32768.0;
+                        var raw = int16Array[i] / 32768.0;
+                        // 一阶高通去直流和低频底噪。
+                        var hp = raw - highPassLastInput + 0.97 * highPassLastOutput;
+                        highPassLastInput = raw;
+                        highPassLastOutput = hp;
+
+                        var sample = hp * AUDIO_GAIN;
+                        // 轻微噪声门：小信号衰减，保留人声主体。
+                        if (Math.abs(sample) < 0.018) {
+                            sample *= 0.18;
+                        }
+                        // 软限幅减少爆音。
+                        sample = Math.tanh(sample * 1.2) / Math.tanh(1.2);
+                        sample = Math.max(-1, Math.min(1, sample));
+                        float32[i] = sample;
+                        var abs = Math.abs(sample);
+                        if (abs > peak) peak = abs;
                     }
+                    lastAudioPeak = peak;
+                    float32 = resampleIfNeeded(float32, audioSampleRate, audioCtx ? audioCtx.sampleRate : audioSampleRate);
                     pushAudioChunk(float32);
-                    scheduleAudioQueue();
-                } catch (e) {}
+                    document.getElementById('audioStatus').textContent = '已连接 ' + AUDIO_DEBUG_VERSION + ' 峰值 ' + peak.toFixed(3);
+                } catch (e) {
+                    console.error('[音频] PCM 处理失败:', e);
+                }
             };
 
             audioWs.onclose = function() {
@@ -1585,35 +1661,6 @@ class StreamManager:
         document.getElementById('audioStatus').textContent = '未连接';
         document.getElementById('audioStatus').className = 'audio-status';
     }
-
-    function startAudioScheduler() {
-        if (audioScheduleTimer) clearInterval(audioScheduleTimer);
-        audioScheduleTimer = setInterval(scheduleAudioQueue, 50);
-    }
-
-    function scheduleAudioQueue() {
-        if (!audioEnabled || !audioCtx || audioCtx.state !== 'running') return;
-
-        if (nextAudioTime < audioCtx.currentTime) {
-            nextAudioTime = audioCtx.currentTime + 0.06;
-        }
-
-        var scheduleUntil = audioCtx.currentTime + AUDIO_BUFFER_SECONDS;
-        while (audioQueue.length > 0 && nextAudioTime < scheduleUntil) {
-            var samples = audioQueue.shift();
-            audioQueuedSamples -= samples.length;
-
-            try {
-                var audioBuffer = audioCtx.createBuffer(1, samples.length, audioSampleRate);
-                audioBuffer.getChannelData(0).set(samples);
-                var source = audioCtx.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(audioCtx.destination);
-                source.start(nextAudioTime);
-                nextAudioTime += samples.length / audioSampleRate;
-            } catch (e) {}
-        }
-    }
     // 页面关闭时清理
     window.addEventListener('beforeunload', function() {
         stopAudioWebSocket();
@@ -1621,10 +1668,7 @@ class StreamManager:
             audioCtx.close();
             audioCtx = null;
         }
-        if (audioScheduleTimer) {
-            clearInterval(audioScheduleTimer);
-            audioScheduleTimer = null;
-        }
+
     });
     </script>
 </body>
@@ -1922,5 +1966,10 @@ class RtspStreamManager:
         """
         self._cleanup()
         print("[RTSP] RTSP推流管理器已销毁")
+
+
+
+
+
 
 

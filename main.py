@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 MaixCAM2 人脸识别智能系统 - UI 版主程序
 
@@ -1221,8 +1221,15 @@ class FaceRecognitionUI:
                     # 5. 业务状态处理（会更新 self._processed_img）
                     self._state_machine.update()
 
-                    # 5.5 状态推送（帧跳：每 N 帧推送一次，避免每帧都做 JSON 序列化）
-                    if self._frame_count % STATUS_SKIP_FRAMES == 0:
+                    audio_client_count = 0
+                    if self._audio_streamer:
+                        audio_client_count = self._audio_streamer.get_client_count()
+
+                    # 5.5 状态推送（音频开启时进一步降频，避免 JSON 序列化抢占主循环）
+                    status_skip = STATUS_SKIP_FRAMES
+                    if audio_client_count > 0:
+                        status_skip = max(status_skip, 10)
+                    if self._frame_count % status_skip == 0:
                         self._status_server.update_status({
                             'state': STATE_NAMES.get(self._state_machine.state, '未知'),
                             'has_face': self._app_state.has_face,
@@ -1249,8 +1256,9 @@ class FaceRecognitionUI:
                     # 9. 显示图像
                     self._disp.show(img)
 
-                    # 10. 推流（帧跳：每 N 帧推流一次，JPEG 编码是主要耗时操作）
-                    if self._stream_manager.is_streaming() and (self._frame_count % STREAM_SKIP_FRAMES == 0):
+                    # 10. 推流（保持配置帧跳，避免音频开启时网页视频帧率突降）
+                    stream_skip = STREAM_SKIP_FRAMES
+                    if self._stream_manager.is_streaming() and (self._frame_count % stream_skip == 0):
                         self._stream_manager.write(img)
 
                     # 11. 短暂休眠（减少休眠时间以提高帧率）
@@ -1329,3 +1337,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+

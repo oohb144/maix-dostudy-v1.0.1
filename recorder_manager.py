@@ -1,4 +1,4 @@
-"""
+﻿"""
 MaixCAM2 人脸识别智能系统 - 录制管理模块
 
 功能：
@@ -115,13 +115,19 @@ class RecorderManager:
                 cam.height()
             )
 
-            # 初始化音频录制器（非阻塞模式）
-            self._audio_recorder = audio.Recorder(
-                self._current_audio_path,
-                block=False  # 非阻塞模式
-            )
-            self._audio_recorder.volume(100)
-            self._audio_recorder.reset(True)  # 开始录制
+            # 初始化音频录制器（非阻塞模式）。
+            # 网页音频推流会占用麦克风，音频忙时降级为只录视频。
+            try:
+                self._audio_recorder = audio.Recorder(
+                    self._current_audio_path,
+                    block=False  # 非阻塞模式
+                )
+                self._audio_recorder.volume(100)
+                self._audio_recorder.reset(True)  # 开始录制
+            except Exception as e:
+                print(f"[录制] 音频录制不可用，改为只录视频: {e}")
+                self._audio_recorder = None
+                self._current_audio_path = ""
 
             # 更新状态
             self._is_recording = True
@@ -129,7 +135,10 @@ class RecorderManager:
 
             print(f"[录制] 开始录制: {filename}")
             print(f"[录制] 视频: {self._current_video_path}")
-            print(f"[录制] 音频: {self._current_audio_path}")
+            if self._current_audio_path:
+                print(f"[录制] 音频: {self._current_audio_path}")
+            else:
+                print("[录制] 音频: 未录制（麦克风被实时推流占用）")
 
             return True
 
@@ -288,3 +297,4 @@ class RecorderManager:
         if self._is_recording:
             self.stop_recording()
         print("[录制] 录制管理器已销毁")
+

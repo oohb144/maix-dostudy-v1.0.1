@@ -56,6 +56,9 @@ class AudioStreamer:
         self._server = None
         self._client_busy = {}
         self._dropped_chunks = 0
+        self._sent_chunks = 0
+        self._empty_reads = 0
+        self._client_pending = {}
         self._need_frames = int(self._chunk_ms * self._sample_rate / 1000)
         self._max_buffer_frames = self._need_frames * 4
 
@@ -69,6 +72,7 @@ class AudioStreamer:
         }
 
         print(f"[音频推流] 初始化完成，端口: {port}, 采样率: {sample_rate}Hz")
+        print("[音频推流] 版本: audio-debug-20260608-2238-adaptive-video")
 
     def start(self):
         """
@@ -157,7 +161,7 @@ class AudioStreamer:
                 self._running = False
                 return
 
-        async def handle_client(websocket, path):
+        async def handle_client(websocket, path=None):
             """处理单个 WebSocket 客户端连接"""
             # 发送音频参数信息
             try:
@@ -287,11 +291,11 @@ class AudioStreamer:
         time.sleep_ms(500)
 
         try:
-            # 初始化音频录制器（无文件路径 = 原始 PCM 模式，非阻塞）
+            # 初始化音频录制器（无文件路径 = 原始 PCM 模式）。采集线程独立运行，使用阻塞读取避免空读。
             self._recorder = audio.Recorder(
                 sample_rate=self._sample_rate,
                 channel=self._channel,
-                block=False
+                block=True
             )
             self._recorder.volume(100)
             self._recorder.reset(True)  # 启动音频流
@@ -316,31 +320,33 @@ class AudioStreamer:
                     client_count = len(self._clients)
 
                 if client_count == 0:
-                    # 没有客户端时丢弃旧音频，避免新客户端听到历史缓冲。
-                    try:
-                        if self._recorder.get_remaining_frames() > self._max_buffer_frames:
-                            self._recorder.record(self._chunk_ms)
-                    except Exception:
-                        pass
-                    time.sleep_ms(100)
+                    # 没有客户端时不读取麦克风，避免 block=True 占用多媒体资源。
+                    time.sleep_ms(200)
                     continue
 
-                # 先检查缓冲区是否有足够的数据
-                remaining = self._recorder.get_remaining_frames()
-                if remaining < self._need_frames:
-                    # 缓冲区数据不足，短暂等待后重试
-                    time.sleep_ms(max(5, self._chunk_ms // 2))
-                    continue
-
-                # 缓冲区过长时主动丢旧数据，保证网页端听到的是实时声音。
-                if remaining > self._max_buffer_frames:
-                    self._recorder.record(self._chunk_ms)
-                    continue
-
-                # 缓冲区有足够数据，读取音频
+                # 阻塞读取一块音频。此处在独立线程中运行，不会阻塞主 UI 循环。
                 pcm_data = self._recorder.record(self._chunk_ms)
 
+                if not pcm_data or len(pcm_data) == 0:
+                    self._empty_reads += 1
+                    if self._empty_reads % 10 == 0:
+                        print(f"[音频推流] 空读 {self._empty_reads} 次, block=True, chunk_ms={self._chunk_ms}")
+                    time.sleep_ms(5)
+                    continue
+
                 if pcm_data and len(pcm_data) > 0:
+                    # MaixPy 返回值可能不是标准 bytes，WebSocket 发送前统一转为二进制字节串。
+                    try:
+                        pcm_data = bytes(pcm_data)
+                    except Exception as e:
+                        print(f"[音频推流] PCM 转换失败: {e}")
+                        continue
+
+                    self._sent_chunks += 1
+                    if self._sent_chunks % 40 == 0:
+                        peak = self._calc_pcm_peak(pcm_data)
+                        print(f"[音频推流] 已发送 {self._sent_chunks} 块, len={len(pcm_data)}, peak={peak}, dropped={self._dropped_chunks}")
+
                     # 广播给所有客户端
                     self._broadcast(pcm_data)
 
@@ -362,6 +368,43 @@ class AudioStreamer:
 
         print("[音频推流] 音频采集线程已退出")
 
+    def _drain_audio_buffer(self, target_frames, max_reads=8):
+        """
+        丢弃旧音频，直到缓冲接近目标帧数。
+        """
+        if not self._recorder:
+            return
+
+        dropped = 0
+        for _ in range(max_reads):
+            try:
+                remaining = self._recorder.get_remaining_frames()
+                if remaining <= target_frames or remaining < self._need_frames:
+                    break
+                self._recorder.record(self._chunk_ms)
+                dropped += 1
+            except Exception:
+                break
+
+        if dropped > 0:
+            self._dropped_chunks += dropped
+
+    def _calc_pcm_peak(self, data):
+        """
+        计算 PCM_S16LE 数据的峰值，用于判断麦克风是否采到有效声音。
+        """
+        peak = 0
+        limit = min(len(data) - 1, 512)
+        for i in range(0, limit, 2):
+            sample = data[i] | (data[i + 1] << 8)
+            if sample >= 32768:
+                sample -= 65536
+            if sample < 0:
+                sample = -sample
+            if sample > peak:
+                peak = sample
+        return peak
+
     def _broadcast(self, data):
         """
         向所有连接的客户端广播音频数据
@@ -375,13 +418,15 @@ class AudioStreamer:
         if not clients or not self._event_loop or not self._event_loop.is_running():
             return
 
-        # 异步发送到所有客户端；上一包没发完时丢弃本包，防止队列无限堆积。
+        # 异步发送到所有客户端；允许少量在途包，避免网络轻微抖动造成音频打洞。
         for ws in clients:
             try:
                 with self._lock:
-                    if self._client_busy.get(ws, False):
+                    pending = self._client_pending.get(ws, 0)
+                    if pending >= 3:
                         self._dropped_chunks += 1
                         continue
+                    self._client_pending[ws] = pending + 1
                     self._client_busy[ws] = True
 
                 future = asyncio.run_coroutine_threadsafe(
@@ -395,6 +440,7 @@ class AudioStreamer:
                 with self._lock:
                     self._clients.discard(ws)
                     self._client_busy.pop(ws, None)
+                    self._client_pending.pop(ws, None)
 
     async def _send_chunk(self, ws, data):
         """
@@ -409,18 +455,23 @@ class AudioStreamer:
         remove_client = False
         try:
             future.result()
-        except Exception:
+        except Exception as e:
+            print(f"[音频推流] 发送失败，移除客户端: {e}")
             remove_client = True
 
         with self._lock:
             if ws not in self._clients:
                 self._client_busy.pop(ws, None)
+                self._client_pending.pop(ws, None)
                 return
 
-            self._client_busy[ws] = False
+            pending = max(0, self._client_pending.get(ws, 1) - 1)
+            self._client_pending[ws] = pending
+            self._client_busy[ws] = pending > 0
             if remove_client:
                 self._clients.discard(ws)
                 self._client_busy.pop(ws, None)
+                self._client_pending.pop(ws, None)
 
     def is_running(self):
         """
@@ -465,6 +516,22 @@ class AudioStreamer:
         """
         self.stop()
         print("[音频推流] 音频推流器已销毁")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

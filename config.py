@@ -150,7 +150,7 @@ STREAM_HEIGHT = 240
 
 # ==================== RTSP推流配置 ====================
 # 是否启用 RTSP 推流（原始画面，用于监控）
-RTSP_ENABLE = False
+RTSP_ENABLE = True
 
 # RTSP 推流分辨率（宽度）- 降低分辨率以提高帧率
 RTSP_WIDTH = 320
@@ -256,7 +256,7 @@ STREAM_JPEG_QUALITY = 45
 
 # ==================== 音频推流配置 ====================
 # 是否启用 WebSocket 音频推流（网页端实时听设备麦克风）
-AUDIO_STREAM_ENABLE = True
+AUDIO_STREAM_ENABLE = False
 # WebSocket 音频推流端口
 AUDIO_STREAM_PORT = 8002
 # 音频采样率（Hz）
@@ -264,5 +264,9 @@ AUDIO_STREAM_SAMPLE_RATE = 16000
 # 音频声道数（1=单声道）
 AUDIO_STREAM_CHANNEL = 1
 # 每次采集时长（毫秒）
-AUDIO_STREAM_CHUNK_MS = 100
+AUDIO_STREAM_CHUNK_MS = 300
+
+
+
+
 
