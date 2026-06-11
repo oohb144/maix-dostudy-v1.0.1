@@ -16,8 +16,8 @@ LED_GPIO = "GPIOA6"
 
 # ==================== 摄像头配置 ====================
 # 降低分辨率以提高帧率（从 640x480 降到 320x240）
-CAMERA_WIDTH = 320
-CAMERA_HEIGHT = 240
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
 
 # ==================== 模型路径配置 ====================
 # 人脸检测模型（YOLOv8-face，官方推荐）
@@ -45,14 +45,14 @@ FACE_IOU_THRESHOLD = 0.4
 FACE_RECOGNIZE_THRESHOLD = 0.72
 
 # 人脸识别超时时间（毫秒）- 无人脸时停止识别并返回空闲
-RECOGNIZE_TIMEOUT = 8000
+RECOGNIZE_TIMEOUT = 5000
 
 # 录入结果显示时间（毫秒）
 ENROLL_SHOW_TIME = 2000
 
 # ==================== 录制配置 ====================
 # 视频录制帧率
-RECORD_VIDEO_FPS = 20
+RECORD_VIDEO_FPS = 30
 
 # 音频录制采样率
 RECORD_AUDIO_SAMPLE_RATE = 16000
@@ -143,20 +143,20 @@ SERIAL_ENABLE = True
 STREAM_ENABLE = True
 
 # 推流分辨率（宽度）- 使用与摄像头相同的分辨率
-STREAM_WIDTH = 320
+STREAM_WIDTH = 640
 
 # 推流分辨率（高度）- 使用与摄像头相同的分辨率
-STREAM_HEIGHT = 240
+STREAM_HEIGHT = 480
 
 # ==================== RTSP推流配置 ====================
 # 是否启用 RTSP 推流（原始画面，用于监控）
 RTSP_ENABLE = False
 
 # RTSP 推流分辨率（宽度）- 降低分辨率以提高帧率
-RTSP_WIDTH = 320
+RTSP_WIDTH = 640
 
 # RTSP 推流分辨率（高度）- 降低分辨率以提高帧率
-RTSP_HEIGHT = 240
+RTSP_HEIGHT = 480
 
 # RTSP 是否启用音频推流
 RTSP_AUDIO_ENABLE = True

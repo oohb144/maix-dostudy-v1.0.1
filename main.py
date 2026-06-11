@@ -363,6 +363,10 @@ class FaceRecognitionUI:
         self._enroll_message = ""
         self._last_face_type = 'none'  # 'none', 'known', 'unknown'
 
+        # 识别帧节流：每 N 帧才做一次重特征识别，画框每帧都跑
+        self._last_recognize_frame = 0
+        self._cached_label_boxes = []  # 缓存上次识别结果（位置 + 标签 + 已知/未知）
+
         # 当前处理后的图像（包含人脸框）
         self._processed_img = None
 
@@ -395,7 +399,6 @@ class FaceRecognitionUI:
             on_enroll=self._on_enroll_click,
             on_settings=self._on_settings_click,
             on_record=self._on_record_click,
-            on_stream=self._on_stream_click,
             on_fusion=self._on_fusion_click
         )
 
@@ -1059,110 +1062,139 @@ class FaceRecognitionUI:
 
     def _handle_recognizing(self):
         """
-        识别状态处理（优化版）：
-        - 使用快速检测模式
+        识别状态处理（高帧率版）：
+        - 每帧轻量检测画框，框跟随画面
+        - 每 5 帧才做一次重识别更新标签
         - 检测到人脸后转换到录制状态
-        - 无人脸超时后返回空闲
         """
         img = self._cam.read()
         faces = self._face_detector.detect_faces_only(img)
 
         if faces:
-            # 检测到人脸后，进行完整的识别
-            recognized_faces = self._face_detector.detect_and_recognize(img)
+            # 重识别节流：每 5 帧才跑一次完整识别
+            if (self._frame_count - self._last_recognize_frame) >= 5:
+                recognized_faces = self._face_detector.detect_and_recognize(img)
+                self._last_recognize_frame = self._frame_count
+                self._cached_label_boxes = []
+                for f in recognized_faces:
+                    self._cached_label_boxes.append({
+                        'x': f.x, 'y': f.y, 'w': f.w, 'h': f.h,
+                        'label': self._face_detector.get_face_label(f),
+                        'is_known': self._face_detector.is_known_face(f),
+                    })
 
-            # 绘制人脸框
-            for face in recognized_faces:
-                color = image.COLOR_GREEN if self._face_detector.is_known_face(face) else image.COLOR_RED
-                label = self._face_detector.get_face_label(face) if self._face_detector.is_known_face(face) else "未知"
-                self._face_detector.draw_face(img, face, color=color, label=label)
+            # 用缓存标签贴到当前轻量检测框上
+            current_labels = []
+            has_known = False
+            for face in faces:
+                cached = self._match_cached_label(face)
+                color = image.COLOR_GREEN if cached and cached['is_known'] else image.COLOR_RED
+                label = cached['label'] if cached and cached['is_known'] else "未知"
+                if cached and cached['is_known']:
+                    has_known = True
+                current_labels.append(label)
+                img.draw_rect(face.x, face.y, face.w, face.h, color=color, thickness=2)
+                if label:
+                    img.draw_string(face.x, max(0, face.y - 22), label, color=color, scale=1.0)
 
-            # 保存处理后的图像（包含人脸框）
             self._processed_img = img
-
-            # 缓存人脸信息
-            self._cached_faces = recognized_faces
-            self._cached_identity_known = any(
-                self._face_detector.is_known_face(face) for face in recognized_faces
+            self._cached_identity_known = has_known
+            self._cached_identity_label = next(
+                (l for l in current_labels if l != "未知"), "未知"
             )
-            if self._cached_identity_known:
-                for face in recognized_faces:
-                    if self._face_detector.is_known_face(face):
-                        self._cached_identity_label = self._face_detector.get_face_label(face)
-                        break
-            else:
-                self._cached_identity_label = "未知"
 
             # 更新人脸详情数据
-            known = sum(1 for f in recognized_faces if self._face_detector.is_known_face(f))
-            unknown = len(recognized_faces) - known
-            labels = [self._face_detector.get_face_label(f) for f in recognized_faces]
-            self._app_state.face_count = len(recognized_faces)
-            self._app_state.known_face_count = known
-            self._app_state.unknown_face_count = unknown
-            self._app_state.face_labels = labels
+            known_count = sum(1 for l in current_labels if l != "未知")
+            self._app_state.face_count = len(faces)
+            self._app_state.known_face_count = known_count
+            self._app_state.unknown_face_count = len(faces) - known_count
+            self._app_state.face_labels = current_labels
 
             # 转换到录制状态
             self._state_machine.transition(State.RECORDING)
             return
 
-        # 未检测到人脸，持续等待，不超时退出
+        # 未检测到人脸，持续等待
         img.draw_string(10, 40, "等待人脸...",
                        color=image.COLOR_YELLOW, scale=TEXT_SCALE)
 
-        # 更新应用状态
         self._app_state.has_face = False
         self._app_state.face_count = 0
         self._app_state.known_face_count = 0
         self._app_state.unknown_face_count = 0
         self._app_state.face_labels = []
 
-        # 保存处理后的图像
         self._processed_img = img
 
     def _handle_recording(self):
         """
-        录制状态处理（优化版）：
-        - 直接完整识别（不再做双重推理）
-        - 编码视频帧
-        - 无人脸超时后返回空闲
+        录制状态处理（高帧率版）：
+        - 每帧轻量检测人脸位置（detect_faces_only），保证框跟随画面
+        - 每 RECOGNIZE_INTERVAL_FRAMES 帧才做一次重识别（detect_and_recognize）更新标签
+        - 通过 IoU 匹配把缓存的标签贴到当前轻量检测框上
+        - 无人脸 3 秒后停止录制并返回识别状态
         """
         img = self._cam.read()
         current_time = time.ticks_ms()
-        recognized_faces = self._face_detector.detect_and_recognize(img)
 
-        if recognized_faces:
+        # 1) 轻量检测：每帧都跑，画框跟随画面
+        light_faces = self._face_detector.detect_faces_only(img)
+
+        # 2) 重识别：每 N 帧跑一次，刷新缓存的身份信息
+        recognize_interval = 5  # 每 5 帧重识别一次
+        if light_faces and (self._frame_count - self._last_recognize_frame) >= recognize_interval:
+            recognized_faces = self._face_detector.detect_and_recognize(img)
+            self._last_recognize_frame = self._frame_count
+            # 缓存识别结果（位置 + 标签 + 已知/未知）
+            self._cached_label_boxes = []
+            for f in recognized_faces:
+                self._cached_label_boxes.append({
+                    'x': f.x, 'y': f.y, 'w': f.w, 'h': f.h,
+                    'label': self._face_detector.get_face_label(f),
+                    'is_known': self._face_detector.is_known_face(f),
+                })
+
+        if light_faces:
             # 检测到人脸，重置无人脸计时
             self._no_face_time = 0
 
-            # 处理每个人脸
-            has_known_face = False
-            for face in recognized_faces:
-                if self._face_detector.is_known_face(face):
-                    has_known_face = True
-                    break
+            # 3) IoU 匹配：把缓存的标签贴到当前轻量检测框上
+            has_known = False
+            current_labels = []
+            for face in light_faces:
+                cached = self._match_cached_label(face)
+                color = image.COLOR_GREEN if cached and cached['is_known'] else image.COLOR_RED
+                label = cached['label'] if cached and cached['is_known'] else "未知"
+                if cached and cached['is_known']:
+                    has_known = True
+                current_labels.append(label)
+                # 直接用 image.draw_rect 比走 face_detector.draw_face 更轻
+                img.draw_rect(face.x, face.y, face.w, face.h, color=color, thickness=2)
+                if label:
+                    img.draw_string(face.x, max(0, face.y - 22), label, color=color, scale=1.0)
 
-            for face in recognized_faces:
-                self._process_face(img, face, has_known_face)
+            # 串口通知（状态变化时发一次）
+            if self._serial_comm and self._serial_comm.is_running():
+                face_type = 'known' if has_known else 'unknown'
+                if self._last_face_type != face_type:
+                    if has_known:
+                        self._serial_comm.send_known_face()
+                    else:
+                        self._serial_comm.send_unknown_face()
+                    self._last_face_type = face_type
 
             # 更新应用状态
             self._app_state.has_face = True
-
-            # 更新人脸详情数据
-            known = sum(1 for f in recognized_faces if self._face_detector.is_known_face(f))
-            unknown = len(recognized_faces) - known
-            labels = [self._face_detector.get_face_label(f) for f in recognized_faces]
-            self._app_state.face_count = len(recognized_faces)
-            self._app_state.known_face_count = known
-            self._app_state.unknown_face_count = unknown
-            self._app_state.face_labels = labels
+            self._app_state.face_count = len(light_faces)
+            self._app_state.known_face_count = sum(1 for l in current_labels if l != "未知")
+            self._app_state.unknown_face_count = len(light_faces) - self._app_state.known_face_count
+            self._app_state.face_labels = current_labels
 
             if self._recorder.is_recording():
                 self._app_state.record_duration = self._recorder.get_recording_duration() // 1000
 
         else:
             # 未检测到人脸
-            self._led_blink(LED_BLINK_SLOW)
             self._app_state.has_face = False
             self._app_state.face_count = 0
             self._app_state.known_face_count = 0
@@ -1172,7 +1204,6 @@ class FaceRecognitionUI:
             if self._no_face_time == 0:
                 self._no_face_time = current_time
 
-            # 无人脸超过 3 秒，停止录制并返回识别状态继续等待
             no_face_duration = current_time - self._no_face_time
             if no_face_duration > 3000:
                 print("[系统] 无人脸超过3秒，停止录制，返回识别状态")
@@ -1183,11 +1214,32 @@ class FaceRecognitionUI:
             img.draw_string(10, 40, f"人脸消失，{remaining}s后停止录制",
                            color=image.COLOR_YELLOW, scale=TEXT_SCALE)
 
-        # 编码当前录制画面。放在末尾可保存带标注/等待提示的画面，并避免短暂无人脸时视频缺帧。
+        # 编码当前录制画面
         self._recorder.encode_frame(img)
-
-        # 保存处理后的图像（关键：必须在return之前保存）
         self._processed_img = img
+
+    def _match_cached_label(self, face):
+        """
+        通过 IoU 匹配把缓存的识别结果（标签）贴到当前轻量检测的框上
+        简化为中心点距离 < 阈值即视为同一人脸
+        """
+        if not self._cached_label_boxes:
+            return None
+        cx = face.x + face.w // 2
+        cy = face.y + face.h // 2
+        best = None
+        best_dist = 1e9
+        threshold = max(face.w, face.h) // 2  # 半个框边长内视为同一人
+        for c in self._cached_label_boxes:
+            ccx = c['x'] + c['w'] // 2
+            ccy = c['y'] + c['h'] // 2
+            d = (cx - ccx) * (cx - ccx) + (cy - ccy) * (cy - ccy)
+            if d < best_dist:
+                best_dist = d
+                best = c
+        if best and best_dist <= threshold * threshold:
+            return best
+        return None
 
     def _handle_manual_recording(self):
         """
@@ -1416,16 +1468,16 @@ class FaceRecognitionUI:
                     # 2. 更新 LED
                     self._led_update()
 
-                    # 3. 检查是否需要保存设置
+                    # 3. 检查是否需要保存设置（仅有标记时执行）
                     if self._app_state.need_save:
                         self._save_settings()
                         self._app_state.need_save = False
 
-                    # 4. 检查阈值是否变化，实时更新检测器
-                    self._check_threshold_update()
-
-                    # 5. 同步设置页中的 HTTP/RTSP 推流开关
-                    self._sync_stream_settings()
+                    # 4. 阈值变化检测和推流同步：每 30 帧才检查一次（约每秒2次）
+                    # 这两个操作不需要每帧执行，避免抢主循环
+                    if self._frame_count % 30 == 0:
+                        self._check_threshold_update()
+                        self._sync_stream_settings()
 
                     # 6. 业务状态处理（会更新 self._processed_img）
                     self._state_machine.update()
