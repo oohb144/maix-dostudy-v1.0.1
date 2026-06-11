@@ -141,13 +141,15 @@ class RecorderManager:
             self._audio_thread_exit = True
 
             if with_audio:
-                # 音频录制独立线程按真实时间阻塞写入 WAV。
+                # 使用非阻塞模式（block=False），避免 record() 持有 GIL 导致主线程卡顿
                 self._audio_recorder = audio.Recorder(
                     self._current_audio_path,
                     sample_rate=self._sample_rate,
-                    channel=self._channel
+                    channel=self._channel,
+                    block=False
                 )
                 self._audio_recorder.volume(100)
+                self._audio_recorder.reset(True)  # 非阻塞模式必须调用 reset(True) 启动
                 self._audio_thread_running = True
                 self._audio_thread_exit = False
                 _thread.start_new_thread(self._audio_record_thread, ())
@@ -200,11 +202,12 @@ class RecorderManager:
             self._last_video_encode_time = current_time
 
             # 编码视频帧
-            # 注意：video.Encoder 需要 YVU420SP 格式，需要先转换
+            # 若摄像头已是 YVU420SP（纯录制模式），直接编码，避免软件色彩转换
             if self._video_encoder:
-                # 将 RGB888 转换为 YVU420SP 格式
-                img_yvu = img.to_format(image.Format.FMT_YVU420SP)
-                self._video_encoder.encode(img_yvu)
+                if img.format() == image.Format.FMT_YVU420SP:
+                    self._video_encoder.encode(img)
+                else:
+                    self._video_encoder.encode(img.to_format(image.Format.FMT_YVU420SP))
                 self._video_frames += 1
 
             return True
@@ -215,28 +218,27 @@ class RecorderManager:
 
     def _audio_record_thread(self):
         """
-        独立音频录制线程
+        独立音频录制线程（非阻塞模式）
 
-        功能：
-        - 按真实时间阻塞读取音频并写入 WAV
-        - 避免音频时长跟随人脸识别/视频编码帧率变短
+        非阻塞 Recorder 立即返回缓冲区当前数据。
+        先 sleep_ms(40) 让硬件积累约 40ms 音频，再 record(50) 取走，
+        sleep_ms 会释放 GIL，主线程（摄像头/编码/UI）可自由运行。
         """
-        print("[录制] 音频录制线程启动")
+        print("[录制] 音频录制线程启动（非阻塞模式）")
         try:
             while self._audio_thread_running:
                 if not self._audio_recorder:
                     break
+                # 等待缓冲区积累足够数据，期间释放 GIL
+                time.sleep_ms(40)
                 data = self._audio_recorder.record(self._audio_chunk_ms)
                 if data and len(data) > 0:
                     self._audio_chunks += 1
                     if self._audio_chunks % 20 == 0:
-                        print(f"[录制] 音频已写入 {self._audio_chunks} 块")
+                        print(f"[录制] 音频已写入 {self._audio_chunks} 块，共约 {self._audio_chunks * self._audio_chunk_ms // 1000}s")
                 else:
                     self._audio_empty_reads += 1
-                    if self._audio_empty_reads % 50 == 0:
-                        print(f"[录制] 音频空读 {self._audio_empty_reads} 次")
         except Exception as e:
-            # 音频录制失败不影响视频录制
             print(f"[录制] 音频录制线程异常: {e}")
         self._audio_thread_exit = True
         print("[录制] 音频录制线程退出")
