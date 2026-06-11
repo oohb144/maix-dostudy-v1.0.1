@@ -968,7 +968,7 @@ class FaceRecognitionUI:
         self._app_state.state = State.RECORDING
         self._led_blink(LED_BLINK_SLOW)
         self._last_record_recognize_time = 0
-        self._recorder.start_recording(self._cam, with_audio=False)
+        self._recorder.start_recording(self._cam, with_audio=True)
 
     def _on_enter_manual_recording(self):
         """进入手动纯录制状态"""
