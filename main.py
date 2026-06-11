@@ -950,10 +950,13 @@ class FaceRecognitionUI:
 
     def _on_enter_recognizing(self):
         """进入识别状态"""
-        print("[状态] 进入识别模式")
+        prev = self._state_machine.prev_state
+        print(f"[状态] 进入识别模式（来自: {prev}）")
         self._app_state.state = State.RECOGNIZING
         self._led_blink(LED_BLINK_FAST)
-        self._audio_play('play_double_beep')
+        # 只有从非录制状态进入时才播提示音，避免每次人脸消失后反复响
+        if prev != State.RECORDING:
+            self._audio_play('play_double_beep')
         self._no_face_time = 0
         self._last_alarm_time = 0
         self._last_success_time = 0
@@ -1103,20 +1106,8 @@ class FaceRecognitionUI:
             self._state_machine.transition(State.RECORDING)
             return
 
-        # 未检测到人脸
-        current_time = time.ticks_ms()
-        if self._no_face_time == 0:
-            self._no_face_time = current_time
-
-        no_face_duration = current_time - self._no_face_time
-        if no_face_duration > RECOGNIZE_TIMEOUT:
-            print("[系统] 无人脸超时，返回空闲状态")
-            self._state_machine.transition(State.IDLE)
-            return
-
-        # 显示等待信息
-        remaining = (RECOGNIZE_TIMEOUT - no_face_duration) // 1000
-        img.draw_string(10, 40, f"等待人脸... {remaining}s",
+        # 未检测到人脸，持续等待，不超时退出
+        img.draw_string(10, 40, "等待人脸...",
                        color=image.COLOR_YELLOW, scale=TEXT_SCALE)
 
         # 更新应用状态
@@ -1181,16 +1172,15 @@ class FaceRecognitionUI:
             if self._no_face_time == 0:
                 self._no_face_time = current_time
 
-            # 检查超时
+            # 无人脸超过 3 秒，停止录制并返回识别状态继续等待
             no_face_duration = current_time - self._no_face_time
-            if no_face_duration > RECOGNIZE_TIMEOUT:
-                print("[系统] 无人脸超时，返回空闲状态")
-                self._state_machine.transition(State.IDLE)
+            if no_face_duration > 3000:
+                print("[系统] 无人脸超过3秒，停止录制，返回识别状态")
+                self._state_machine.transition(State.RECOGNIZING)
                 return
 
-            # 显示等待信息
-            remaining = (RECOGNIZE_TIMEOUT - no_face_duration) // 1000
-            img.draw_string(10, 40, f"等待人脸... {remaining}s",
+            remaining = (3000 - no_face_duration) // 1000
+            img.draw_string(10, 40, f"人脸消失，{remaining}s后停止录制",
                            color=image.COLOR_YELLOW, scale=TEXT_SCALE)
 
         # 编码当前录制画面。放在末尾可保存带标注/等待提示的画面，并避免短暂无人脸时视频缺帧。
