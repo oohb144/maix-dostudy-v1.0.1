@@ -3,7 +3,7 @@ name: 做中学
 version: 1.2.0
 author: oohb144
 icon: app.png
-desc: 人脸识别智能系统 - 检测自动录制、熟人/陌生人标记、网页端状态同步、实时音频推流
+desc: 人脸识别智能系统检测自动录制熟人/陌生人标记网页端状态同步实时音频推流，实现开关推流，实现音频融合，音频录制实现，但是帧率过低，先行暂停。
 files:
   - audio_controller.py
   - audio_streamer.py
@@ -24,4 +24,5 @@ files:
   - test_performance.py
   - ui_pages.py
   - ui.py
+  - video_player_manager.py
   - voice_recognition.py

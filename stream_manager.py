@@ -37,6 +37,7 @@ class StreamManager:
         """
         self._server = None
         self._is_streaming = False
+        self._is_stopping = False
         self._stream_url = ""
         self._jpeg_quality = jpeg_quality
 
@@ -1705,6 +1706,7 @@ class StreamManager:
             return True
 
         try:
+            self._is_stopping = False
             # 创建 HTTP JPEG 流服务器
             self._server = http.JpegStreamer()
 
@@ -1745,7 +1747,7 @@ class StreamManager:
             True: 写入成功
             False: 写入失败或未推流
         """
-        if not self._is_streaming or self._server is None:
+        if self._is_stopping or not self._is_streaming or self._server is None:
             return False
 
         try:
@@ -1773,6 +1775,7 @@ class StreamManager:
             return True
 
         try:
+            self._is_stopping = True
             self._cleanup()
             print("[推流] HTTP 推流已停止")
             return True
@@ -1787,6 +1790,7 @@ class StreamManager:
         """
         self._server = None
         self._is_streaming = False
+        self._is_stopping = False
         self._stream_url = ""
 
     def is_streaming(self):
@@ -1839,6 +1843,7 @@ class RtspStreamManager:
         self._cam = None
         self._audio_recorder = None
         self._is_streaming = False
+        self._is_stopping = False
         self._rtsp_url = ""
 
         print("[RTSP] RTSP推流管理器初始化完成")
@@ -1877,6 +1882,7 @@ class RtspStreamManager:
             return True
 
         try:
+            self._is_stopping = False
             from maix import rtsp, camera, image, audio
 
             # 创建独立的摄像头实例（YVU420SP格式）
@@ -1953,12 +1959,41 @@ class RtspStreamManager:
         """
         清理推流资源
         """
-        # 注意：RTSP没有stop方法，只能销毁引用
+        # 部分固件的 RTSP 对象没有 stop 方法，只能销毁引用
+        try:
+            if self._server:
+                stop = getattr(self._server, "stop", None)
+                if stop:
+                    stop()
+        except Exception as e:
+            print(f"[RTSP] 停止服务失败: {e}")
+
         self._audio_recorder = None
         self._cam = None
         self._server = None
         self._is_streaming = False
+        self._is_stopping = False
         self._rtsp_url = ""
+
+    def stop(self):
+        """
+        停止RTSP推流
+
+        返回：
+            True: 已停止或无需停止
+            False: 停止失败
+        """
+        if not self._is_streaming:
+            return True
+
+        try:
+            self._is_stopping = True
+            self._cleanup()
+            print("[RTSP] RTSP推流已停止")
+            return True
+        except Exception as e:
+            print(f"[RTSP] 停止失败: {e}")
+            return False
 
     def destroy(self):
         """

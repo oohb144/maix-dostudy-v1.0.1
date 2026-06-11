@@ -30,7 +30,8 @@ class VoiceRecognition:
     - 非阻塞运行（独立线程）
     """
 
-    def __init__(self, model_path="/root/models/am_3332_192_int8.mud"):
+    def __init__(self, model_path="/root/models/am_3332_192_int8.mud",
+                 run_interval_ms=80, pause_sleep_ms=150, kws_gate=0.25):
         """
         初始化语音识别器
 
@@ -42,6 +43,10 @@ class VoiceRecognition:
         self._is_running = False
         self._keywords = {}
         self._callback = None
+        self._pause_callback = None
+        self._run_interval_ms = run_interval_ms
+        self._pause_sleep_ms = pause_sleep_ms
+        self._kws_gate = kws_gate
         self._lock = _thread.allocate_lock()
 
         # 默认关键词配置（拼音声调格式）
@@ -105,6 +110,16 @@ class VoiceRecognition:
         self._callback = callback
         print("[语音] 设置识别回调函数")
 
+    def set_pause_callback(self, callback):
+        """
+        设置暂停判断回调函数
+
+        参数：
+            callback: 返回 True 时暂停本轮语音识别，给主循环让出资源
+        """
+        self._pause_callback = callback
+        print("[语音] 设置低占用暂停回调")
+
     def start(self, keywords=None, callback=None):
         """
         启动语音识别
@@ -157,7 +172,7 @@ class VoiceRecognition:
 
         # 构建关键词表和阈值
         kw_tbl = list(self._keywords.keys())
-        kw_gate = [0.1] * len(kw_tbl)  # 每个关键词的置信度门限
+        kw_gate = [self._kws_gate] * len(kw_tbl)  # 每个关键词的置信度门限
 
         # 识别回调函数
         def on_recognize(data, length):
@@ -188,9 +203,15 @@ class VoiceRecognition:
         # 运行识别循环
         while self._is_running and not app.need_exit():
             try:
+                if self._pause_callback and self._pause_callback():
+                    time.sleep_ms(self._pause_sleep_ms)
+                    continue
+
                 frames = self._speech.run(1)
                 if frames < 1:
-                    time.sleep_ms(10)
+                    time.sleep_ms(self._run_interval_ms)
+                else:
+                    time.sleep_ms(self._run_interval_ms)
             except Exception as e:
                 print(f"[语音] 识别循环异常: {e}")
                 time.sleep_ms(100)

@@ -52,7 +52,7 @@ ENROLL_SHOW_TIME = 2000
 
 # ==================== 录制配置 ====================
 # 视频录制帧率
-RECORD_VIDEO_FPS = 25
+RECORD_VIDEO_FPS = 20
 
 # 音频录制采样率
 RECORD_AUDIO_SAMPLE_RATE = 16000
@@ -150,7 +150,7 @@ STREAM_HEIGHT = 240
 
 # ==================== RTSP推流配置 ====================
 # 是否启用 RTSP 推流（原始画面，用于监控）
-RTSP_ENABLE = True
+RTSP_ENABLE = False
 
 # RTSP 推流分辨率（宽度）- 降低分辨率以提高帧率
 RTSP_WIDTH = 320
@@ -164,6 +164,15 @@ RTSP_AUDIO_ENABLE = True
 # ==================== 语音识别配置 ====================
 # 语音模型路径
 VOICE_MODEL_PATH = "/root/models/am_3332_192_int8.mud"
+
+# 语音识别低占用模式：
+# 注意：当前人脸检测 + 特征模型常驻后，MaixCAM2 剩余内存不足以再常驻 nn.Speech。
+# 因此默认关闭本机语音模型，保留串口语音命令以保证帧率和稳定性。
+# 如需单独测试本机语音模型，可临时打开 VOICE_ENABLE，并关闭人脸/推流等重负载功能。
+VOICE_PAUSE_WHEN_ACTIVE = True
+VOICE_RUN_INTERVAL_MS = 80
+VOICE_PAUSE_SLEEP_MS = 150
+VOICE_KWS_GATE = 0.25
 
 # 音频文件目录
 AUDIO_DIR = "/root/audio/"
@@ -208,7 +217,8 @@ class State(IntEnum):
     RECOGNIZING = 1    # 人脸识别状态
     ENROLLING = 2      # 人脸录入状态
     RECORDING = 3      # 录制状态（与识别同时进行）
-    ERROR = 4          # 错误状态
+    MANUAL_RECORDING = 4  # 手动纯录制状态
+    ERROR = 5          # 错误状态
 
 # 状态名称映射（用于显示）
 STATE_NAMES = {
@@ -216,6 +226,7 @@ STATE_NAMES = {
     State.RECOGNIZING: "识别中",
     State.ENROLLING: "录入中",
     State.RECORDING: "录制中",
+    State.MANUAL_RECORDING: "纯录制",
     State.ERROR: "错误"
 }
 
@@ -261,12 +272,24 @@ AUDIO_STREAM_ENABLE = False
 AUDIO_STREAM_PORT = 8002
 # 音频采样率（Hz）
 AUDIO_STREAM_SAMPLE_RATE = 16000
+
+# 更激进的识别降频配置：优先保证画面帧率。
+RECOGNIZE_DETECT_INTERVAL_MS = 800
+RECORD_RECOGNIZE_INTERVAL_MS = 1000
 # 音频声道数（1=单声道）
 AUDIO_STREAM_CHANNEL = 1
 # 每次采集时长（毫秒）
 AUDIO_STREAM_CHUNK_MS = 300
 
 
-
-
-
+# ==================== 有效运行参数覆盖区 ====================
+# 上方部分中文注释在当前文件编码下会和变量粘连，导致变量被注释吞掉。
+# 这里集中重新定义主程序会导入的运行参数，保证上板后导入稳定。
+DETECT_FAST_THRESHOLD_SCALE = 0.8
+RECOGNIZE_DETECT_INTERVAL_MS = 800
+RECORD_RECOGNIZE_INTERVAL_MS = 1000
+SUCCESS_COOLDOWN_MS = 3000
+ALARM_COOLDOWN_MS = 1000
+STREAM_JPEG_QUALITY = 45
+AUDIO_STREAM_ENABLE = False
+AUDIO_STREAM_SAMPLE_RATE = 16000

@@ -13,6 +13,7 @@ MaixCAM2 人脸识别智能系统 - 录制管理模块
 
 from maix import video, audio, time, image
 import os
+import _thread
 
 class RecorderManager:
     """
@@ -56,6 +57,15 @@ class RecorderManager:
 
         # 音频录制参数
         self._audio_chunk_ms = 50  # 每次读取50ms的音频数据
+        self._last_audio_sync_time = 0
+        self._audio_chunks = 0
+        self._audio_empty_reads = 0
+        self._audio_thread_running = False
+        self._audio_thread_exit = True
+        self._last_video_encode_time = 0
+        self._video_frame_interval_ms = max(1, int(1000 / fps))
+        self._video_frames = 0
+        self._video_skip_frames = 0
 
         # 确保录制目录存在
         self._ensure_dir(record_dir)
@@ -87,12 +97,13 @@ class RecorderManager:
         timestamp = time.ticks_ms()
         return f"{prefix}_{timestamp}"
 
-    def start_recording(self, cam):
+    def start_recording(self, cam, with_audio=True):
         """
         开始录制视频+音频
 
         参数：
             cam: 摄像头对象
+            with_audio: 是否同时录制音频
 
         返回：
             True: 录制启动成功
@@ -108,37 +119,55 @@ class RecorderManager:
             self._current_video_path = f"{self._record_dir}/{filename}.mp4"
             self._current_audio_path = f"{self._record_dir}/{filename}.wav"
 
-            # 初始化视频编码器（正确用法：文件路径作为第一个参数）
-            self._video_encoder = video.Encoder(
-                self._current_video_path,
-                cam.width(),
-                cam.height()
-            )
-
-            # 初始化音频录制器（非阻塞模式）。
-            # 网页音频推流会占用麦克风，音频忙时降级为只录视频。
+            # 初始化视频编码器（优先设置文件帧率，固件不支持时回退旧构造方式）
             try:
+                self._video_encoder = video.Encoder(
+                    self._current_video_path,
+                    cam.width(),
+                    cam.height(),
+                    framerate=self._fps
+                )
+            except Exception as e:
+                print(f"[录制] 设置视频帧率失败，使用默认编码器参数: {e}")
+                self._video_encoder = video.Encoder(
+                    self._current_video_path,
+                    cam.width(),
+                    cam.height()
+                )
+
+            self._audio_chunks = 0
+            self._audio_empty_reads = 0
+            self._audio_thread_running = False
+            self._audio_thread_exit = True
+
+            if with_audio:
+                # 音频录制独立线程按真实时间阻塞写入 WAV。
                 self._audio_recorder = audio.Recorder(
                     self._current_audio_path,
-                    block=False  # 非阻塞模式
+                    sample_rate=self._sample_rate,
+                    channel=self._channel
                 )
                 self._audio_recorder.volume(100)
-                self._audio_recorder.reset(True)  # 开始录制
-            except Exception as e:
-                print(f"[录制] 音频录制不可用，改为只录视频: {e}")
+                self._audio_thread_running = True
+                self._audio_thread_exit = False
+                _thread.start_new_thread(self._audio_record_thread, ())
+            else:
                 self._audio_recorder = None
                 self._current_audio_path = ""
 
             # 更新状态
             self._is_recording = True
             self._recording_start_time = time.ticks_ms()
+            self._last_video_encode_time = 0
+            self._video_frames = 0
+            self._video_skip_frames = 0
 
             print(f"[录制] 开始录制: {filename}")
             print(f"[录制] 视频: {self._current_video_path}")
             if self._current_audio_path:
                 print(f"[录制] 音频: {self._current_audio_path}")
             else:
-                print("[录制] 音频: 未录制（麦克风被实时推流占用）")
+                print("[录制] 音频: 已禁用")
 
             return True
 
@@ -162,16 +191,21 @@ class RecorderManager:
             return False
 
         try:
+            current_time = time.ticks_ms()
+            if self._last_video_encode_time:
+                elapsed = current_time - self._last_video_encode_time
+                if elapsed < self._video_frame_interval_ms:
+                    self._video_skip_frames += 1
+                    return True
+            self._last_video_encode_time = current_time
+
             # 编码视频帧
             # 注意：video.Encoder 需要 YVU420SP 格式，需要先转换
             if self._video_encoder:
                 # 将 RGB888 转换为 YVU420SP 格式
                 img_yvu = img.to_format(image.Format.FMT_YVU420SP)
                 self._video_encoder.encode(img_yvu)
-
-            # 同步录制音频（非阻塞）
-            if self._audio_recorder:
-                self._sync_audio()
+                self._video_frames += 1
 
             return True
 
@@ -179,27 +213,33 @@ class RecorderManager:
             print(f"[录制] 编码异常: {e}")
             return False
 
-    def _sync_audio(self):
+    def _audio_record_thread(self):
         """
-        同步录制音频数据
+        独立音频录制线程
 
         功能：
-        - 检查是否有足够的音频帧
-        - 读取并保存音频数据
+        - 按真实时间阻塞读取音频并写入 WAV
+        - 避免音频时长跟随人脸识别/视频编码帧率变短
         """
+        print("[录制] 音频录制线程启动")
         try:
-            # 检查剩余帧数
-            remaining_frames = self._audio_recorder.get_remaining_frames()
-            need_frames = self._audio_chunk_ms * self._sample_rate // 1000
-
-            # 如果有足够的帧，读取一部分
-            if remaining_frames >= need_frames:
+            while self._audio_thread_running:
+                if not self._audio_recorder:
+                    break
                 data = self._audio_recorder.record(self._audio_chunk_ms)
-                # 数据已经被录制到文件中
-
+                if data and len(data) > 0:
+                    self._audio_chunks += 1
+                    if self._audio_chunks % 20 == 0:
+                        print(f"[录制] 音频已写入 {self._audio_chunks} 块")
+                else:
+                    self._audio_empty_reads += 1
+                    if self._audio_empty_reads % 50 == 0:
+                        print(f"[录制] 音频空读 {self._audio_empty_reads} 次")
         except Exception as e:
             # 音频录制失败不影响视频录制
-            print(f"[录制] 音频同步警告: {e}")
+            print(f"[录制] 音频录制线程异常: {e}")
+        self._audio_thread_exit = True
+        print("[录制] 音频录制线程退出")
 
     def stop_recording(self):
         """
@@ -219,6 +259,10 @@ class RecorderManager:
             # 停止音频录制
             if self._audio_recorder:
                 try:
+                    self._audio_thread_running = False
+                    wait_start = time.ticks_ms()
+                    while not self._audio_thread_exit and time.ticks_ms() - wait_start < 500:
+                        time.sleep_ms(20)
                     self._audio_recorder.finish()
                 except Exception as e:
                     print(f"[录制] 音频停止异常: {e}")
@@ -231,12 +275,24 @@ class RecorderManager:
             video_path = self._current_video_path
             audio_path = self._current_audio_path
 
+            if audio_path:
+                try:
+                    if (not os.path.exists(audio_path)) or os.path.getsize(audio_path) <= 44:
+                        print("[录制] 音频文件未生成有效数据，本次仅保留视频")
+                        audio_path = ""
+                    else:
+                        print(f"[录制] 音频块数: {self._audio_chunks}, 文件大小: {os.path.getsize(audio_path)} 字节")
+                except Exception as e:
+                    print(f"[录制] 检查音频文件失败: {e}")
+                    audio_path = ""
+
             # 重置状态
             self._is_recording = False
             self._current_video_path = ""
             self._current_audio_path = ""
 
             print(f"[录制] 录制停止，时长: {duration}ms")
+            print(f"[录制] 视频帧数: {self._video_frames}, 跳过帧数: {self._video_skip_frames}")
             print(f"[录制] 视频文件: {video_path}")
             print(f"[录制] 音频文件: {audio_path}")
 
@@ -254,10 +310,12 @@ class RecorderManager:
         self._video_encoder = None
         if self._audio_recorder:
             try:
+                self._audio_thread_running = False
                 self._audio_recorder.finish()
             except Exception as e:
                 print(f"[录制] 音频停止异常: {e}")
             self._audio_recorder = None
+        self._audio_thread_exit = True
         self._is_recording = False
 
     def is_recording(self):

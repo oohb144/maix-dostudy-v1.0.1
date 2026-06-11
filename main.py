@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 MaixCAM2 人脸识别智能系统 - UI 版主程序
 
@@ -48,6 +48,8 @@ from config import (
     RTSP_ENABLE, RTSP_WIDTH, RTSP_HEIGHT, RTSP_AUDIO_ENABLE,
     # 语音识别配置
     VOICE_MODEL_PATH, AUDIO_DIR, VOICE_KEYWORDS,
+    VOICE_PAUSE_WHEN_ACTIVE, VOICE_RUN_INTERVAL_MS,
+    VOICE_PAUSE_SLEEP_MS, VOICE_KWS_GATE,
     # 串口通信配置
     SERIAL_PORT, SERIAL_BAUDRATE, SERIAL_TX_PIN, SERIAL_RX_PIN,
     # 状态定义
@@ -69,6 +71,7 @@ from led_controller import LedController
 from audio_controller import AudioController
 from face_detector import FaceDetector
 from recorder_manager import RecorderManager
+from video_player_manager import VideoPlayerManager
 from stream_manager import StreamManager, RtspStreamManager
 from audio_streamer import AudioStreamer
 from status_server import StatusServer
@@ -77,7 +80,7 @@ from serial_comm import SerialComm, RecvCmd, SendCmd
 
 # 导入 UI 模块
 from ui import UIManager, ResolutionAdapter
-from ui_pages import HomePage, SettingsPage, EnrollPage, RecordingsPage
+from ui_pages import HomePage, SettingsPage, EnrollPage, RecordingsPage, FusionPlayerPage
 
 
 class AppState:
@@ -108,8 +111,9 @@ class AppState:
         self.conf_threshold = FACE_CONF_THRESHOLD
         self.recognize_threshold = FACE_RECOGNIZE_THRESHOLD
         self.recordings = []
+        self.fusion_items = []
+        self.muxed_videos = []
         self.need_save = False
-        self.fps = 0
 
 
 class FaceRecognitionUI:
@@ -185,7 +189,15 @@ class FaceRecognitionUI:
         self._voice_recognition = None
         if VOICE_ENABLE:
             print("[系统] 初始化语音识别器...")
-            self._voice_recognition = VoiceRecognition(VOICE_MODEL_PATH)
+            self._voice_recognition = VoiceRecognition(
+                VOICE_MODEL_PATH,
+                run_interval_ms=VOICE_RUN_INTERVAL_MS,
+                pause_sleep_ms=VOICE_PAUSE_SLEEP_MS,
+                kws_gate=VOICE_KWS_GATE
+            )
+            self._voice_recognition.set_pause_callback(
+                self._should_pause_voice_recognition
+            )
         else:
             print("[系统] 语音识别已禁用")
 
@@ -219,6 +231,7 @@ class FaceRecognitionUI:
             sample_rate=RECORD_AUDIO_SAMPLE_RATE,
             channel=RECORD_AUDIO_CHANNEL
         )
+        self._video_player = VideoPlayerManager(self._disp, RECORD_DIR)
 
         print("[系统] 初始化按键管理器...")
         self._key_manager = KeyManager(
@@ -289,6 +302,11 @@ class FaceRecognitionUI:
             self._adapter, self._app_state
         )
 
+        self._fusion_player_page = FusionPlayerPage(
+            self._ui_manager, self._ts, self._disp,
+            self._adapter, self._app_state
+        )
+
         # 设置页面回调
         self._setup_page_callbacks()
 
@@ -312,6 +330,7 @@ class FaceRecognitionUI:
         self._state_machine.register_handler(State.IDLE, self._handle_idle)
         self._state_machine.register_handler(State.RECOGNIZING, self._handle_recognizing)
         self._state_machine.register_handler(State.RECORDING, self._handle_recording)
+        self._state_machine.register_handler(State.MANUAL_RECORDING, self._handle_manual_recording)
         self._state_machine.register_handler(State.ENROLLING, self._handle_enrolling)
         self._state_machine.register_handler(State.ERROR, self._handle_error)
 
@@ -319,19 +338,25 @@ class FaceRecognitionUI:
         self._state_machine.register_enter_callback(State.IDLE, self._on_enter_idle)
         self._state_machine.register_enter_callback(State.RECOGNIZING, self._on_enter_recognizing)
         self._state_machine.register_enter_callback(State.RECORDING, self._on_enter_recording)
+        self._state_machine.register_enter_callback(State.MANUAL_RECORDING, self._on_enter_manual_recording)
         self._state_machine.register_enter_callback(State.ENROLLING, self._on_enter_enrolling)
         self._state_machine.register_enter_callback(State.ERROR, self._on_enter_error)
 
         # 注册状态退出回调
         self._state_machine.register_exit_callback(State.RECOGNIZING, self._on_exit_recognizing)
         self._state_machine.register_exit_callback(State.RECORDING, self._on_exit_recording)
+        self._state_machine.register_exit_callback(State.MANUAL_RECORDING, self._on_exit_manual_recording)
         self._state_machine.register_exit_callback(State.ENROLLING, self._on_exit_enrolling)
 
         # ==================== 状态变量 ====================
         self._no_face_time = 0
         self._last_alarm_time = 0
         self._last_success_time = 0
+        self._last_recognize_detect_time = 0
+        self._last_record_recognize_time = 0
         self._cached_faces = []
+        self._cached_identity_label = "未知"
+        self._cached_identity_known = False
         self._cached_img = None
         self._enroll_show_time = 0
         self._enroll_success = False
@@ -340,11 +365,6 @@ class FaceRecognitionUI:
 
         # 当前处理后的图像（包含人脸框）
         self._processed_img = None
-
-        # 性能监控变量
-        self._fps_counter = 0
-        self._fps_start_time = time.ticks_ms()
-        self._current_fps = 0
 
         # 帧跳计数器（用于降低推流和状态推送频率）
         self._frame_count = 0
@@ -374,7 +394,9 @@ class FaceRecognitionUI:
             on_recognize=self._on_recognize_click,
             on_enroll=self._on_enroll_click,
             on_settings=self._on_settings_click,
-            on_stream=self._on_stream_click
+            on_record=self._on_record_click,
+            on_stream=self._on_stream_click,
+            on_fusion=self._on_fusion_click
         )
 
         # 录入页按钮回调
@@ -391,20 +413,27 @@ class FaceRecognitionUI:
             on_clear=self._on_clear_recordings
         )
 
+        # 融合播放页按钮回调
+        self._fusion_player_page.set_callbacks(
+            on_refresh=self._on_fusion_refresh,
+            on_mux=self._on_fusion_mux,
+            on_play=self._on_fusion_play
+        )
+
     # ==================== 按钮回调函数 ====================
     def _on_recognize_click(self):
         """识别按钮点击"""
         current_state = self._state_machine.state
         if current_state == State.IDLE:
             self._state_machine.transition(State.RECOGNIZING)
-        elif current_state in (State.RECOGNIZING, State.RECORDING):
+        elif current_state in (State.RECOGNIZING, State.RECORDING, State.MANUAL_RECORDING):
             self._state_machine.transition(State.IDLE)
 
     def _on_enroll_click(self):
         """录入按钮点击 - 跳转到录入页并进入录入状态"""
         # 先停止当前状态（如果正在识别或录制）
         current_state = self._state_machine.state
-        if current_state in (State.RECOGNIZING, State.RECORDING):
+        if current_state in (State.RECOGNIZING, State.RECORDING, State.MANUAL_RECORDING):
             self._state_machine.transition(State.IDLE)
 
         # 更新人脸列表（确保显示最新数据）
@@ -420,15 +449,31 @@ class FaceRecognitionUI:
         """设置按钮点击 - 跳转到设置页"""
         self._ui_manager.push(self._settings_page)
 
+    def _on_record_click(self):
+        """纯录制按钮点击"""
+        current_state = self._state_machine.state
+        if current_state == State.MANUAL_RECORDING:
+            self._state_machine.transition(State.IDLE)
+            return
+
+        if current_state in (State.RECOGNIZING, State.RECORDING, State.ENROLLING):
+            self._state_machine.transition(State.IDLE)
+
+        if self._state_machine.state == State.IDLE:
+            self._state_machine.transition(State.MANUAL_RECORDING)
+
     def _on_stream_click(self):
         """推流按钮点击"""
-        if self._stream_manager.is_streaming():
-            self._stream_manager.stop()
-            self._app_state.stream_enable = False
-        else:
-            self._stream_manager.start()
-            self._app_state.stream_enable = True
-            self._app_state.stream_url = self._stream_manager.get_stream_url()
+        self._app_state.stream_enable = not self._app_state.stream_enable
+        self._sync_stream_settings()
+
+    def _on_fusion_click(self):
+        """融合播放按钮点击"""
+        current_state = self._state_machine.state
+        if current_state in (State.RECOGNIZING, State.RECORDING, State.MANUAL_RECORDING):
+            self._state_machine.transition(State.IDLE)
+        self._refresh_fusion_items("已读取融合列表")
+        self._ui_manager.push(self._fusion_player_page)
 
     def _on_enroll_face_click(self):
         """录入人脸按钮点击"""
@@ -447,6 +492,18 @@ class FaceRecognitionUI:
             self._state_machine.transition(State.IDLE)
 
     # ==================== 语音命令回调 ====================
+
+    def _should_pause_voice_recognition(self):
+        """判断是否暂停语音识别，避免影响视频帧率"""
+        if not VOICE_PAUSE_WHEN_ACTIVE:
+            return False
+
+        return self._state_machine.state in (
+            State.RECOGNIZING,
+            State.RECORDING,
+            State.MANUAL_RECORDING,
+            State.ENROLLING,
+        )
 
     def _on_voice_command(self, command):
         """
@@ -497,7 +554,7 @@ class FaceRecognitionUI:
 
         elif command == 'stop':
             # 停止当前操作
-            if current_state in (State.RECOGNIZING, State.RECORDING):
+            if current_state in (State.RECOGNIZING, State.RECORDING, State.MANUAL_RECORDING):
                 self._state_machine.transition(State.IDLE)
             elif current_state == State.ENROLLING:
                 self._state_machine.transition(State.IDLE)
@@ -573,6 +630,8 @@ class FaceRecognitionUI:
 
         # 切换录入界面 (0x03)
         elif cmd_id == RecvCmd.GO_ENROLL_PAGE:
+            if current_state in (State.RECOGNIZING, State.RECORDING, State.MANUAL_RECORDING):
+                self._state_machine.transition(State.IDLE)
             if len(self._ui_manager.page_stack) == 1:
                 self._ui_manager.push(self._enroll_page)
             print("[串口] 切换到录入界面")
@@ -593,7 +652,7 @@ class FaceRecognitionUI:
 
         # 停止识别/录制 (0x06)
         elif cmd_id == RecvCmd.STOP_RECOGNIZE:
-            if current_state in (State.RECOGNIZING, State.RECORDING):
+            if current_state in (State.RECOGNIZING, State.RECORDING, State.MANUAL_RECORDING):
                 self._state_machine.transition(State.IDLE)
             elif current_state == State.ENROLLING:
                 self._state_machine.transition(State.IDLE)
@@ -636,6 +695,42 @@ class FaceRecognitionUI:
         # TODO: 实现删除选中录像
         print("[UI] 删除录像功能待实现")
 
+    def _refresh_fusion_items(self, status_text="已刷新"):
+        """刷新融合播放页面列表"""
+        items = self._video_player.list_video_items()
+        self._app_state.fusion_items = items
+        self._app_state.muxed_videos = [item for item in items if item.get('av_size', 0) > 0]
+        self._fusion_player_page.set_status(status_text)
+        print(f"[融合] 原始视频: {len(items)}, 已融合: {len(self._app_state.muxed_videos)}")
+
+    def _on_fusion_refresh(self):
+        """读取融合页面文件列表"""
+        self._refresh_fusion_items("读取完成")
+
+    def _on_fusion_mux(self):
+        """手动融合所有可融合录像"""
+        self._fusion_player_page.set_status("正在融合，请稍候")
+        success_count, total_count = self._video_player.mux_all()
+        self._refresh_fusion_items(f"融合完成 {success_count}/{total_count}")
+        self._update_recordings_list()
+
+    def _on_fusion_play(self):
+        """播放选中的融合视频"""
+        muxed_videos = self._app_state.muxed_videos
+        if not muxed_videos:
+            self._fusion_player_page.set_status("暂无融合视频可播放")
+            print("[融合] 暂无融合视频可播放")
+            return
+
+        index = self._fusion_player_page.get_selected_index()
+        if index >= len(muxed_videos):
+            index = 0
+        item = muxed_videos[index]
+        av_path = item.get('av_path', '')
+        self._fusion_player_page.set_status(f"播放: {item.get('av_name', '')}")
+        self._video_player.play(av_path)
+        self._refresh_fusion_items("播放结束")
+
     def _on_clear_recordings(self):
         """清空所有录像"""
         try:
@@ -643,6 +738,16 @@ class FaceRecognitionUI:
                 path = os.path.join(RECORD_DIR, rec.get('name', ''))
                 if os.path.exists(path):
                     os.remove(path)
+                audio_name = rec.get('audio_name', '')
+                if audio_name:
+                    audio_path = os.path.join(RECORD_DIR, audio_name)
+                    if os.path.exists(audio_path):
+                        os.remove(audio_path)
+                av_name = rec.get('av_name', '')
+                if av_name:
+                    av_path = os.path.join(RECORD_DIR, av_name)
+                    if os.path.exists(av_path):
+                        os.remove(av_path)
             self._app_state.recordings = []
             self._update_recordings_list()
             print("[UI] 已清空所有录像")
@@ -670,9 +775,38 @@ class FaceRecognitionUI:
             if os.path.exists(RECORD_DIR):
                 for f in os.listdir(RECORD_DIR):
                     if f.endswith('.mp4'):
+                        if f.endswith('_av.mp4'):
+                            continue
                         path = os.path.join(RECORD_DIR, f)
                         size = os.path.getsize(path)
-                        recordings.append({'name': f, 'size': size})
+                        base = f[:-4]
+                        audio_name = base + '.wav'
+                        audio_path = os.path.join(RECORD_DIR, audio_name)
+                        audio_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
+                        av_name = base + '_av.mp4'
+                        av_path = os.path.join(RECORD_DIR, av_name)
+                        av_size = os.path.getsize(av_path) if os.path.exists(av_path) else 0
+                        recordings.append({
+                            'name': f,
+                            'size': size,
+                            'audio_name': audio_name if audio_size > 0 else '',
+                            'audio_size': audio_size,
+                            'av_name': av_name if av_size > 0 else '',
+                            'av_size': av_size,
+                        })
+                    elif f.endswith('.wav'):
+                        base = f[:-4]
+                        video_name = base + '.mp4'
+                        video_path = os.path.join(RECORD_DIR, video_name)
+                        if os.path.exists(video_path):
+                            continue
+                        path = os.path.join(RECORD_DIR, f)
+                        recordings.append({
+                            'name': f,
+                            'size': os.path.getsize(path),
+                            'audio_name': f,
+                            'audio_size': os.path.getsize(path),
+                        })
             recordings.sort(key=lambda x: x['name'], reverse=True)
             self._app_state.recordings = recordings
         except Exception as e:
@@ -694,6 +828,37 @@ class FaceRecognitionUI:
             self._last_conf_threshold = current_conf
             self._last_recognize_threshold = current_recognize
 
+    def _sync_stream_settings(self):
+        """同步设置页推流开关到实际服务"""
+        try:
+            if self._app_state.stream_enable:
+                if self._stream_manager and not self._stream_manager.is_streaming():
+                    if self._stream_manager.start():
+                        self._app_state.stream_url = self._stream_manager.get_stream_url()
+                    else:
+                        self._app_state.stream_enable = False
+                        self._app_state.stream_url = ""
+            else:
+                if self._stream_manager and self._stream_manager.is_streaming():
+                    self._stream_manager.stop()
+                self._app_state.stream_url = ""
+
+            if self._app_state.rtsp_enable:
+                if self._rtsp_manager and not self._rtsp_manager.is_streaming():
+                    if self._rtsp_manager.start(RTSP_WIDTH, RTSP_HEIGHT, RTSP_AUDIO_ENABLE):
+                        self._rtsp_url = self._rtsp_manager.get_url()
+                        self._app_state.rtsp_url = self._rtsp_url
+                    else:
+                        self._app_state.rtsp_enable = False
+                        self._app_state.rtsp_url = ""
+            else:
+                if self._rtsp_manager and self._rtsp_manager.is_streaming():
+                    self._rtsp_manager.stop()
+                self._rtsp_url = ""
+                self._app_state.rtsp_url = ""
+        except Exception as e:
+            print(f"[系统] 同步推流设置失败: {e}")
+
     def _save_settings(self):
         """保存设置到应用配置"""
         try:
@@ -703,6 +868,8 @@ class FaceRecognitionUI:
                                   str(self._app_state.recognize_threshold), False)
             app.set_app_config_kv('face_detect', 'stream_enable',
                                   str(self._app_state.stream_enable), False)
+            app.set_app_config_kv('face_detect', 'rtsp_enable',
+                                  str(self._app_state.rtsp_enable), False)
             app.set_app_config_kv('face_detect', 'audio_enable',
                                   str(self._app_state.audio_enable), False)
             app.set_app_config_kv('face_detect', 'led_enable',
@@ -746,6 +913,8 @@ class FaceRecognitionUI:
             self._state_machine.transition(State.IDLE)
         elif current_state == State.RECORDING:
             self._state_machine.transition(State.IDLE)
+        elif current_state == State.MANUAL_RECORDING:
+            self._state_machine.transition(State.IDLE)
         elif current_state == State.ENROLLING:
             self._do_enroll_face()
         elif current_state == State.ERROR:
@@ -774,6 +943,8 @@ class FaceRecognitionUI:
         self._led_blink(LED_BLINK_IDLE)
         self._no_face_time = 0
         self._cached_faces = []
+        self._cached_identity_label = "未知"
+        self._cached_identity_known = False
         self._cached_img = None
         self._last_face_type = 'none'  # 重置人脸类型
 
@@ -786,13 +957,33 @@ class FaceRecognitionUI:
         self._no_face_time = 0
         self._last_alarm_time = 0
         self._last_success_time = 0
+        self._last_recognize_detect_time = 0
+        self._cached_faces = []
+        self._cached_identity_label = "未知"
+        self._cached_identity_known = False
 
     def _on_enter_recording(self):
         """进入录制状态"""
         print("[状态] 检测到人脸，开始录制")
         self._app_state.state = State.RECORDING
         self._led_blink(LED_BLINK_SLOW)
-        self._recorder.start_recording(self._cam)
+        self._last_record_recognize_time = 0
+        self._recorder.start_recording(self._cam, with_audio=False)
+
+    def _on_enter_manual_recording(self):
+        """进入手动纯录制状态"""
+        print("[状态] 进入纯录制模式")
+        self._app_state.state = State.MANUAL_RECORDING
+        self._led_blink(LED_BLINK_SLOW)
+        self._app_state.has_face = False
+        self._app_state.face_count = 0
+        self._app_state.known_face_count = 0
+        self._app_state.unknown_face_count = 0
+        self._app_state.face_labels = []
+        self._cached_faces = []
+        self._cached_identity_label = "未知"
+        self._cached_identity_known = False
+        self._recorder.start_recording(self._cam, with_audio=True)
 
     def _on_enter_enrolling(self):
         """进入录入状态"""
@@ -822,6 +1013,17 @@ class FaceRecognitionUI:
             video_path, audio_path = self._recorder.stop_recording()
             print(f"[录制] 视频文件: {video_path}")
             print(f"[录制] 音频文件: {audio_path}")
+            self._update_recordings_list()
+
+    def _on_exit_manual_recording(self):
+        """退出手动纯录制状态"""
+        print("[状态] 退出纯录制模式，停止录制")
+        if self._recorder.is_recording():
+            result = self._recorder.stop_recording()
+            if result:
+                video_path, audio_path = result
+                print(f"[录制] 视频文件: {video_path}")
+                print(f"[录制] 音频文件: {audio_path}")
             self._update_recordings_list()
 
     def _on_exit_enrolling(self):
@@ -860,9 +1062,6 @@ class FaceRecognitionUI:
         - 无人脸超时后返回空闲
         """
         img = self._cam.read()
-
-        # 使用快速检测模式（仅检测位置，不进行身份识别）
-        # 这样可以提高检测速度
         faces = self._face_detector.detect_faces_only(img)
 
         if faces:
@@ -880,6 +1079,16 @@ class FaceRecognitionUI:
 
             # 缓存人脸信息
             self._cached_faces = recognized_faces
+            self._cached_identity_known = any(
+                self._face_detector.is_known_face(face) for face in recognized_faces
+            )
+            if self._cached_identity_known:
+                for face in recognized_faces:
+                    if self._face_detector.is_known_face(face):
+                        self._cached_identity_label = self._face_detector.get_face_label(face)
+                        break
+            else:
+                self._cached_identity_label = "未知"
 
             # 更新人脸详情数据
             known = sum(1 for f in recognized_faces if self._face_detector.is_known_face(f))
@@ -896,11 +1105,9 @@ class FaceRecognitionUI:
 
         # 未检测到人脸
         current_time = time.ticks_ms()
-
         if self._no_face_time == 0:
             self._no_face_time = current_time
 
-        # 检查超时
         no_face_duration = current_time - self._no_face_time
         if no_face_duration > RECOGNIZE_TIMEOUT:
             print("[系统] 无人脸超时，返回空闲状态")
@@ -930,16 +1137,12 @@ class FaceRecognitionUI:
         - 无人脸超时后返回空闲
         """
         img = self._cam.read()
-
-        # 直接进行完整识别（不再先快检再识别，避免双重推理）
+        current_time = time.ticks_ms()
         recognized_faces = self._face_detector.detect_and_recognize(img)
 
         if recognized_faces:
             # 检测到人脸，重置无人脸计时
             self._no_face_time = 0
-
-            # 编码视频帧
-            self._recorder.encode_frame(img)
 
             # 处理每个人脸
             has_known_face = False
@@ -975,7 +1178,6 @@ class FaceRecognitionUI:
             self._app_state.unknown_face_count = 0
             self._app_state.face_labels = []
 
-            current_time = time.ticks_ms()
             if self._no_face_time == 0:
                 self._no_face_time = current_time
 
@@ -991,7 +1193,33 @@ class FaceRecognitionUI:
             img.draw_string(10, 40, f"等待人脸... {remaining}s",
                            color=image.COLOR_YELLOW, scale=TEXT_SCALE)
 
+        # 编码当前录制画面。放在末尾可保存带标注/等待提示的画面，并避免短暂无人脸时视频缺帧。
+        self._recorder.encode_frame(img)
+
         # 保存处理后的图像（关键：必须在return之前保存）
+        self._processed_img = img
+
+    def _handle_manual_recording(self):
+        """
+        手动纯录制状态处理：
+        - 不运行任何 AI 人脸识别
+        - 仅采集当前画面并编码音视频
+        - 更新录制时长用于 UI 显示
+        """
+        img = self._cam.read()
+
+        self._app_state.has_face = False
+        self._app_state.face_count = 0
+        self._app_state.known_face_count = 0
+        self._app_state.unknown_face_count = 0
+        self._app_state.face_labels = []
+
+        if self._recorder.is_recording():
+            self._recorder.encode_frame(img)
+            self._app_state.record_duration = self._recorder.get_recording_duration() // 1000
+        else:
+            self._app_state.record_duration = 0
+
         self._processed_img = img
 
     def _process_face(self, img, face, has_known_face):
@@ -1160,33 +1388,21 @@ class FaceRecognitionUI:
         self._processed_img = img
 
     # ==================== 主循环 ====================
-    def _update_fps(self):
-        """更新帧率计算"""
-        self._fps_counter += 1
-        current_time = time.ticks_ms()
-        elapsed = current_time - self._fps_start_time
-
-        # 每秒更新一次帧率
-        if elapsed >= 1000:
-            self._current_fps = self._fps_counter * 1000 // elapsed
-            self._fps_counter = 0
-            self._fps_start_time = current_time
-            # 更新应用状态中的帧率
-            self._app_state.fps = self._current_fps
-
     def run(self):
         """运行主循环"""
         print("[系统] 开始运行主循环...")
 
         # 延迟启动 RTSP 推流（避免在 __init__ 中与 display 冲突）
-        if RTSP_ENABLE and self._rtsp_manager:
+        if self._app_state.rtsp_enable and self._rtsp_manager:
             print("[系统] 延迟启动 RTSP 推流服务...")
             try:
                 self._rtsp_manager.start(RTSP_WIDTH, RTSP_HEIGHT, RTSP_AUDIO_ENABLE)
                 self._rtsp_url = self._rtsp_manager.get_url()
                 self._app_state.rtsp_url = self._rtsp_url
+                self._app_state.rtsp_enable = self._rtsp_manager.is_streaming()
             except Exception as e:
                 print(f"[系统] RTSP 启动失败: {e}")
+                self._app_state.rtsp_enable = False
 
         # 延迟启动音频推流（避免在 __init__ 中与音频录制器冲突）
         if self._audio_streamer:
@@ -1218,7 +1434,10 @@ class FaceRecognitionUI:
                     # 4. 检查阈值是否变化，实时更新检测器
                     self._check_threshold_update()
 
-                    # 5. 业务状态处理（会更新 self._processed_img）
+                    # 5. 同步设置页中的 HTTP/RTSP 推流开关
+                    self._sync_stream_settings()
+
+                    # 6. 业务状态处理（会更新 self._processed_img）
                     self._state_machine.update()
 
                     audio_client_count = 0
@@ -1241,14 +1460,11 @@ class FaceRecognitionUI:
                             'record_duration': self._app_state.record_duration,
                         })
 
-                    # 6. 使用处理后的图像（包含人脸框）
+                    # 7. 使用处理后的图像（包含人脸框）
                     if self._processed_img is not None:
                         img = self._processed_img
                     else:
                         img = self._cam.read()
-
-                    # 7. 更新帧率计数
-                    self._update_fps()
 
                     # 8. UI 页面绘制（叠加按钮、状态栏等）
                     self._ui_manager.update(img)
@@ -1337,5 +1553,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

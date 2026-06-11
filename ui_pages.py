@@ -146,10 +146,10 @@ class HomePage(Page):
 
         # 按钮布局（直接用 320x240 图像坐标，不缩放）
         # handle_event 会自动把图像坐标映射到显示器坐标来检测触摸
-        btn_w, btn_h = 70, 50
+        btn_w, btn_h = 48, 50
         btn_y = 180
-        btn_spacing = 10
-        total_w = 4 * btn_w + 3 * btn_spacing
+        btn_spacing = 5
+        total_w = 6 * btn_w + 5 * btn_spacing
         start_x = (320 - total_w) // 2
 
         # 创建功能按钮
@@ -186,8 +186,19 @@ class HomePage(Page):
             text_scale=1.0
         )
 
-        self._btn_stream = Button(
+        self._btn_record = Button(
             rect=[start_x + 3 * (btn_w + btn_spacing), btn_y, btn_w, btn_h],
+            label='录制',
+            callback=None,
+            bg_color=BTN_DANGER,
+            pressed_color=BTN_DANGER_PRESSED,
+            text_color=C_WHITE,
+            border_thickness=0,
+            text_scale=1.0
+        )
+
+        self._btn_stream = Button(
+            rect=[start_x + 4 * (btn_w + btn_spacing), btn_y, btn_w, btn_h],
             label='推流',
             callback=None,
             bg_color=BTN_SECONDARY,
@@ -197,13 +208,26 @@ class HomePage(Page):
             text_scale=1.0
         )
 
+        self._btn_fusion = Button(
+            rect=[start_x + 5 * (btn_w + btn_spacing), btn_y, btn_w, btn_h],
+            label='融合',
+            callback=None,
+            bg_color=BTN_SUCCESS,
+            pressed_color=BTN_SUCCESS_PRESSED,
+            text_color=C_WHITE,
+            border_thickness=0,
+            text_scale=1.0
+        )
+
         # 添加按钮到管理器
         self._btn_manager.add_button(self._btn_recognize)
         self._btn_manager.add_button(self._btn_enroll)
         self._btn_manager.add_button(self._btn_settings)
+        self._btn_manager.add_button(self._btn_record)
         self._btn_manager.add_button(self._btn_stream)
+        self._btn_manager.add_button(self._btn_fusion)
 
-    def set_callbacks(self, on_recognize, on_enroll, on_settings, on_stream):
+    def set_callbacks(self, on_recognize, on_enroll, on_settings, on_record, on_stream, on_fusion):
         """
         设置按钮回调函数
 
@@ -211,12 +235,16 @@ class HomePage(Page):
             on_recognize: 识别按钮回调
             on_enroll: 录入按钮回调（应跳转到录入页）
             on_settings: 设置按钮回调（应跳转到设置页）
+            on_record: 纯录制按钮回调
             on_stream: 推流按钮回调
+            on_fusion: 融合播放按钮回调
         """
         self._btn_recognize.callback = on_recognize
         self._btn_enroll.callback = on_enroll
         self._btn_settings.callback = on_settings
+        self._btn_record.callback = on_record
         self._btn_stream.callback = on_stream
+        self._btn_fusion.callback = on_fusion
 
     def update(self, img):
         """
@@ -244,18 +272,12 @@ class HomePage(Page):
                        color=image.Color.from_rgb(*C_GREEN),
                        scale=0.7)
 
-        # 绘制帧率
-        fps = self._app_state.fps
-        img.draw_string(160, 3, f'FPS:{fps}',
-                       color=image.Color.from_rgb(*C_YELLOW),
-                       scale=0.7)
-
         # 绘制底部信息栏
         img.draw_rect(0, img.height() - 16, img.width(), 16,
                      color=image.Color.from_rgb(*C_BLACK), thickness=-1)
 
         # 显示录制时长（如果正在录制）
-        if current_state == State.RECORDING:
+        if current_state in (State.RECORDING, State.MANUAL_RECORDING):
             duration = self._app_state.record_duration
             img.draw_string(2, img.height() - 14, f'录制:{duration}s',
                            color=image.Color.from_rgb(*C_RED),
@@ -355,9 +377,19 @@ class SettingsPage(SubPage):
             off_color=C_GRAY
         )
 
+        # RTSP 推流开关
+        self._switch_rtsp = Switch(
+            position=[30, 195],
+            scale=1.0,
+            is_on=app_state.rtsp_enable,
+            callback=lambda v: self._on_rtsp_toggle(v),
+            on_color=C_GREEN,
+            off_color=C_GRAY
+        )
+
         # 音频提示开关
         self._switch_audio = Switch(
-            position=[30, 195],
+            position=[30, 235],
             scale=1.0,
             is_on=app_state.audio_enable,
             callback=lambda v: self._on_audio_toggle(v),
@@ -367,7 +399,7 @@ class SettingsPage(SubPage):
 
         # LED 指示开关
         self._switch_led = Switch(
-            position=[30, 235],
+            position=[30, 275],
             scale=1.0,
             is_on=app_state.led_enable,
             callback=lambda v: self._on_led_toggle(v),
@@ -377,6 +409,7 @@ class SettingsPage(SubPage):
 
         # 添加开关到管理器
         self._switch_manager.add_switch(self._switch_stream)
+        self._switch_manager.add_switch(self._switch_rtsp)
         self._switch_manager.add_switch(self._switch_audio)
         self._switch_manager.add_switch(self._switch_led)
 
@@ -385,7 +418,7 @@ class SettingsPage(SubPage):
 
         # 恢复默认按钮
         self._btn_reset = Button(
-            rect=[30, 280, 120, 40],
+            rect=[30, 320, 120, 40],
             label='恢复默认',
             callback=lambda: self._on_reset(),
             bg_color=BTN_SECONDARY,
@@ -397,7 +430,7 @@ class SettingsPage(SubPage):
 
         # 保存设置按钮
         self._btn_save = Button(
-            rect=[170, 280, 120, 40],
+            rect=[170, 320, 120, 40],
             label='保存设置',
             callback=lambda: self._on_save(),
             bg_color=BTN_PRIMARY,
@@ -409,7 +442,7 @@ class SettingsPage(SubPage):
 
         # 退出程序按钮
         self._btn_exit = Button(
-            rect=[30, 330, 260, 40],
+            rect=[30, 370, 260, 40],
             label='退出程序',
             callback=lambda: self._on_exit(),
             bg_color=BTN_DANGER,
@@ -436,6 +469,10 @@ class SettingsPage(SubPage):
         """推流开关切换回调"""
         self._app_state.stream_enable = is_on
 
+    def _on_rtsp_toggle(self, is_on):
+        """RTSP 推流开关切换回调"""
+        self._app_state.rtsp_enable = is_on
+
     def _on_audio_toggle(self, is_on):
         """音频开关切换回调"""
         self._app_state.audio_enable = is_on
@@ -449,6 +486,7 @@ class SettingsPage(SubPage):
         self._app_state.conf_threshold = 0.3
         self._app_state.recognize_threshold = 0.6
         self._app_state.stream_enable = True
+        self._app_state.rtsp_enable = False
         self._app_state.audio_enable = False
         self._app_state.led_enable = False
 
@@ -456,6 +494,7 @@ class SettingsPage(SubPage):
         self._slider_conf.value = 30
         self._slider_recognize.value = 60
         self._switch_stream.is_on = True
+        self._switch_rtsp.is_on = False
         self._switch_audio.is_on = False
         self._switch_led.is_on = False
 
@@ -476,6 +515,11 @@ class SettingsPage(SubPage):
         参数：
             img: 图像对象
         """
+        self._switch_stream.is_on = self._app_state.stream_enable
+        self._switch_rtsp.is_on = self._app_state.rtsp_enable
+        self._switch_audio.is_on = self._app_state.audio_enable
+        self._switch_led.is_on = self._app_state.led_enable
+
         # 处理返回按钮
         self.handle_back_button(img)
 
@@ -495,13 +539,19 @@ class SettingsPage(SubPage):
                            color=image.Color.from_rgb(*C_WHITE),
                            scale=1.0)
 
-        y_audio = 200 - self._scroll_y
+        y_rtsp = 200 - self._scroll_y
+        if 40 < y_rtsp < img.height() - 60:
+            img.draw_string(90, y_rtsp, 'RTSP 推流',
+                           color=image.Color.from_rgb(*C_WHITE),
+                           scale=1.0)
+
+        y_audio = 240 - self._scroll_y
         if 40 < y_audio < img.height() - 60:
             img.draw_string(90, y_audio, '音频提示',
                            color=image.Color.from_rgb(*C_WHITE),
                            scale=1.0)
 
-        y_led = 235 - self._scroll_y
+        y_led = 275 - self._scroll_y
         if 40 < y_led < img.height() - 60:
             img.draw_string(90, y_led, 'LED 指示',
                            color=image.Color.from_rgb(*C_WHITE),
@@ -525,11 +575,12 @@ class SettingsPage(SubPage):
         y_conf = 60 - self._scroll_y
         y_recognize = 110 - self._scroll_y
         y_stream = 155 - self._scroll_y
-        y_audio = 195 - self._scroll_y
-        y_led = 235 - self._scroll_y
-        y_btn_reset = 280 - self._scroll_y
-        y_btn_save = 280 - self._scroll_y
-        y_btn_exit = 330 - self._scroll_y
+        y_rtsp = 195 - self._scroll_y
+        y_audio = 235 - self._scroll_y
+        y_led = 275 - self._scroll_y
+        y_btn_reset = 320 - self._scroll_y
+        y_btn_save = 320 - self._scroll_y
+        y_btn_exit = 370 - self._scroll_y
 
         # 更新滑块位置
         self._slider_conf.rect = [30, y_conf, 260, 20]
@@ -539,6 +590,10 @@ class SettingsPage(SubPage):
         self._switch_stream.pos = [30, y_stream]
         self._switch_stream.rect = [30, y_stream,
                                      self._switch_stream.width, self._switch_stream.height]
+
+        self._switch_rtsp.pos = [30, y_rtsp]
+        self._switch_rtsp.rect = [30, y_rtsp,
+                                   self._switch_rtsp.width, self._switch_rtsp.height]
 
         self._switch_audio.pos = [30, y_audio]
         self._switch_audio.rect = [30, y_audio,
@@ -766,14 +821,14 @@ class RecordingsPage(SubPage):
 
         # 刷新按钮（直接用图像坐标）
         self._btn_refresh = Button(
-            rect=[30, 180, 80, 40],
+            rect=[30, 180, 60, 40],
             label='刷新',
             callback=None,
             bg_color=BTN_PRIMARY,
             pressed_color=BTN_PRIMARY_PRESSED,
             text_color=C_WHITE,
             border_thickness=0,
-            text_scale=1.0
+            text_scale=0.9
         )
 
         # 删除选中按钮
@@ -842,7 +897,15 @@ class RecordingsPage(SubPage):
             name = rec.get('name', 'unknown')
             size = rec.get('size', 0)
             size_str = f'{size / 1024 / 1024:.1f}MB' if size > 1024*1024 else f'{size / 1024:.1f}KB'
-            img.draw_string(30, 75 + i * 20, f'{name} {size_str}',
+            audio_size = rec.get('audio_size', 0)
+            av_size = rec.get('av_size', 0)
+            if av_size > 0:
+                audio_mark = '+AV'
+            elif audio_size > 0:
+                audio_mark = '+WAV'
+            else:
+                audio_mark = '无音频'
+            img.draw_string(30, 75 + i * 20, f'{name} {size_str} {audio_mark}',
                            color=image.Color.from_rgb(*C_LIGHT_GRAY),
                            scale=0.7)
 
@@ -852,4 +915,144 @@ class RecordingsPage(SubPage):
                            scale=0.9)
 
         # 处理按钮事件
+        self._btn_manager.handle_events(img)
+
+
+# ==================== 融合播放页 ====================
+class FusionPlayerPage(SubPage):
+    """
+    融合播放页
+
+    功能：
+    - 读取原始录像与已融合视频列表
+    - 手动触发 MP4/WAV 融合
+    - 选择已融合视频并播放
+    """
+
+    def __init__(self, ui_manager, ts, disp, adapter, app_state):
+        """初始化融合播放页"""
+        super().__init__(ui_manager, ts, disp, adapter)
+        self._app_state = app_state
+        self._selected_index = 0
+        self._last_touch_pressed = False
+        self._status_text = "等待读取"
+
+        self._btn_manager = ButtonManager(ts, disp)
+
+        self._btn_refresh = Button(
+            rect=[30, 190, 60, 40],
+            label='读取',
+            callback=None,
+            bg_color=BTN_PRIMARY,
+            pressed_color=BTN_PRIMARY_PRESSED,
+            text_color=C_WHITE,
+            border_thickness=0,
+            text_scale=0.9
+        )
+
+        self._btn_mux = Button(
+            rect=[95, 190, 60, 40],
+            label='融合',
+            callback=None,
+            bg_color=BTN_SUCCESS,
+            pressed_color=BTN_SUCCESS_PRESSED,
+            text_color=C_WHITE,
+            border_thickness=0,
+            text_scale=0.9
+        )
+
+        self._btn_play = Button(
+            rect=[160, 190, 60, 40],
+            label='播放',
+            callback=None,
+            bg_color=BTN_SUCCESS,
+            pressed_color=BTN_SUCCESS_PRESSED,
+            text_color=C_WHITE,
+            border_thickness=0,
+            text_scale=0.9
+        )
+
+        self._btn_back_home = Button(
+            rect=[225, 190, 65, 40],
+            label='返回',
+            callback=self._on_back_click,
+            bg_color=BTN_SECONDARY,
+            pressed_color=BTN_SECONDARY_PRESSED,
+            text_color=C_WHITE,
+            border_thickness=0,
+            text_scale=0.9
+        )
+
+        self._btn_manager.add_button(self._btn_refresh)
+        self._btn_manager.add_button(self._btn_mux)
+        self._btn_manager.add_button(self._btn_play)
+        self._btn_manager.add_button(self._btn_back_home)
+
+    def set_callbacks(self, on_refresh, on_mux, on_play):
+        """设置按钮回调函数"""
+        self._btn_refresh.callback = on_refresh
+        self._btn_mux.callback = on_mux
+        self._btn_play.callback = on_play
+
+    def set_status(self, text):
+        """设置页面状态提示"""
+        self._status_text = text
+
+    def get_selected_index(self):
+        """获取当前选中的列表索引"""
+        return self._selected_index
+
+    def _handle_list_touch(self, img):
+        """处理列表项触摸选择"""
+        try:
+            x, y, pressed = self._ts.read()
+            img_w, img_h = img.width(), img.height()
+            disp_w, disp_h = self._disp.width(), self._disp.height()
+            if disp_w > 0 and disp_h > 0:
+                x = int(x * img_w / disp_w)
+                y = int(y * img_h / disp_h)
+            if pressed and not self._last_touch_pressed:
+                if 25 <= x <= 300 and 75 <= y <= 165:
+                    index = (y - 75) // 22
+                    muxed_items = self._app_state.muxed_videos
+                    if 0 <= index < len(muxed_items[:4]):
+                        self._selected_index = index
+            self._last_touch_pressed = pressed
+        except Exception:
+            pass
+
+    def update(self, img):
+        """更新融合播放页"""
+        self.handle_back_button(img)
+        self.draw_title(img, '融合播放')
+        self._handle_list_touch(img)
+
+        raw_count = len(self._app_state.fusion_items)
+        muxed_count = len(self._app_state.muxed_videos)
+        img.draw_string(30, 45, f'原始:{raw_count}  已融合:{muxed_count}',
+                       color=image.Color.from_rgb(*C_WHITE),
+                       scale=0.9)
+        img.draw_string(30, 62, self._status_text,
+                       color=image.Color.from_rgb(*C_YELLOW),
+                       scale=0.7)
+
+        muxed_items = self._app_state.muxed_videos
+        for i, item in enumerate(muxed_items[:4]):
+            y = 78 + i * 22
+            bg_color = C_DARK_GRAY if i == self._selected_index else C_BLACK
+            img.draw_rect(25, y - 2, 270, 20,
+                         color=image.Color.from_rgb(*bg_color),
+                         thickness=-1)
+            name = item.get('av_name') or item.get('name', 'unknown')
+            size = item.get('av_size', 0)
+            size_str = f'{size / 1024 / 1024:.1f}MB' if size > 1024 * 1024 else f'{size / 1024:.1f}KB'
+            img.draw_string(30, y, f'{i + 1}. {name} {size_str}',
+                           color=image.Color.from_rgb(*C_LIGHT_GRAY),
+                           scale=0.65)
+
+        if len(muxed_items) == 0:
+            img.draw_string(30, 85, '暂无融合视频，点击“融合”生成',
+                           color=image.Color.from_rgb(*C_GRAY),
+                           scale=0.8)
+
         self._btn_manager.handle_events(img)
