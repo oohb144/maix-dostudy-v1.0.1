@@ -20,8 +20,13 @@ CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 
 # ==================== 模型路径配置 ====================
-# 人脸检测模型（YOLOv8-face，官方推荐）
-FACE_DETECT_MODEL = "/root/models/yolov8n_face.mud"
+# 人脸检测模型：根据设备型号自动选择（MaixCAM2 使用 yolo11s，MaixCAM 使用 yolov8n）
+from maix import sys as _maix_sys
+FACE_DETECT_MODEL = (
+    "/root/models/yolo11s_face.mud"
+    if _maix_sys.device_name().lower() == "maixcam2"
+    else "/root/models/yolov8n_face.mud"
+)
 
 # 人脸特征提取模型（InsightFace ResNet50）
 FACE_FEATURE_MODEL = "/root/models/insghtface_webface_r50.mud"
@@ -127,13 +132,19 @@ FACE_BOX_THICKNESS = 2
 
 # ==================== 功能开关 ====================
 # 是否启用音频提示
-AUDIO_ENABLE = False
+AUDIO_ENABLE = True
+
+# 是否启用自动录制（识别到人脸时自动录制；关闭则只识别/播音效不录制）
+AUTO_RECORD_ENABLE = True
 
 # 是否启用 LED 指示灯
 LED_ENABLE = False
 
-# 是否启用语音识别（需要语音模型文件）
+# 是否启用本机离线语音识别（需要语音模型文件，占内存）
 VOICE_ENABLE = False
+
+# 是否启用在线语音识别（DashScope 实时识别，需联网，不占本机模型内存）
+ONLINE_VOICE_ENABLE = True
 
 # 是否启用串口通信（接收外部语音开发板命令）
 SERIAL_ENABLE = True
@@ -177,6 +188,34 @@ VOICE_KWS_GATE = 0.25
 # 音频文件目录
 AUDIO_DIR = "/root/audio/"
 
+# ==================== 提示音效配置（WAV 文件） ====================
+# 识别到陌生人时播放
+SOUND_STRANGER = "/root/error.wav"
+# 识别到熟人时播放
+SOUND_KNOWN = "/root/meldix-success.wav"
+# 录入成功时播放
+SOUND_ENROLL_SUCCESS = "/root/meldix-success.wav"
+
+# 语音播报音效配置（固定中文语音 WAV，由 scripts/gen_voice 生成，拷入 /root/voice/）
+# 语气：简洁条理机感；缺失文件时音频控制器会静默跳过（不崩）
+VOICE_DIR              = "/root/voice/"
+VOICE_SYS_READY        = VOICE_DIR + "sys_ready.wav"        # 开机就绪
+VOICE_START_RECOGNIZE  = VOICE_DIR + "start_recognize.wav"  # 进入识别
+VOICE_START_ENROLL     = VOICE_DIR + "start_enroll.wav"     # 进入录入
+VOICE_ERROR            = VOICE_DIR + "error_alert.wav"      # 进入错误
+VOICE_KNOWN            = VOICE_DIR + "known_face.wav"       # 识别到熟人
+VOICE_STRANGER         = VOICE_DIR + "stranger.wav"         # 识别到陌生人
+VOICE_CMD_HOME         = VOICE_DIR + "cmd_home.wav"         # 回声：已返回主页
+VOICE_CMD_SETTINGS     = VOICE_DIR + "cmd_settings.wav"     # 回声：已进入设置
+VOICE_CMD_ENROLL       = VOICE_DIR + "cmd_enroll.wav"       # 回声：已进入录入
+VOICE_CMD_RECORDINGS   = VOICE_DIR + "cmd_recordings.wav"   # 回声：已打开录像
+VOICE_CMD_START        = VOICE_DIR + "cmd_start.wav"        # 回声：开始识别
+VOICE_CMD_STOP         = VOICE_DIR + "cmd_stop.wav"         # 回声：已停止
+VOICE_ENROLL_OK        = VOICE_DIR + "enroll_ok.wav"        # 录入成功
+VOICE_ENROLL_FAIL      = VOICE_DIR + "enroll_fail.wav"      # 录入失败
+VOICE_RECORD_SAVED     = VOICE_DIR + "record_saved.wav"     # 录制已保存
+VOICE_READ_INFO_HINT   = VOICE_DIR + "read_info_hint.wav"   # 引导查看屏幕信息
+
 # 关键词配置（拼音声调格式 -> 命令名）
 VOICE_KEYWORDS = {
     # 界面切换命令
@@ -189,6 +228,8 @@ VOICE_KEYWORDS = {
     'shi2 bie2': 'recognize',              # 识别
     'ting2 zhi3': 'stop',                  # 停止
     'kai1 shi3': 'start',                  # 开始
+    'da4 kai1 lu4 zhi4': 'auto_record_on',    # 打开录制
+    'guan1 bi4 lu4 zhi4': 'auto_record_off',  # 关闭录制
 
     # 信息查询命令
     'du2 qu3 xin4 xi1': 'read_info',       # 读取信息
@@ -197,6 +238,43 @@ VOICE_KEYWORDS = {
     # 音频播放命令
     'bo1 fang4 yin1 pin3': 'play_audio',   # 播放音频
     'ting2 zhi3 bo1 fang4': 'stop_audio',  # 停止播放
+}
+
+# ==================== 在线语音识别配置（DashScope paraformer-realtime-v2） ====================
+# DashScope API Key
+DASHSCOPE_API_KEY = "sk-dc4553ef7fe74c5283f05e4dc7d60adb"
+
+# 在线识别采样率（需与模型一致）
+ONLINE_VOICE_SAMPLE_RATE = 16000
+
+# 在线关键词配置（中文文本子串 -> 命令名）
+# 命令名与离线版、串口版保持一致，统一走 _on_voice_command 处理
+ONLINE_VOICE_KEYWORDS = {
+    # 界面切换命令
+    '主界面': 'home', '回到主页': 'home', '主页': 'home',
+    '设置': 'settings',
+    '录入': 'enroll',
+    '录像': 'recordings',
+
+    # 播放/融合界面命令（具体词在前，避免“播放”被通用匹配）
+    '进入播放界面': 'fusion_page', '播放界面': 'fusion_page', '进入播放': 'fusion_page',
+    '开始融合': 'fusion_mux', '融合视频': 'fusion_mux', '融合': 'fusion_mux',
+    '播放录像': 'fusion_play', '播放视频': 'fusion_play', '开始播放': 'fusion_play',
+
+    # 音频播放命令（具体词在前，避免被“停止/播放”误匹配）
+    '播放音频': 'play_audio',
+    '停止播放': 'stop_audio',
+
+    # 功能控制命令
+    '开始识别': 'recognize',
+    '打开自动录制': 'auto_record_on', '开启自动录制': 'auto_record_on', '打开录制': 'auto_record_on',
+    '关闭自动录制': 'auto_record_off', '关闭录制': 'auto_record_off',
+    '停止': 'stop',
+    '开始': 'start',
+
+    # 信息查询命令
+    '读取信息': 'read_info',
+    '显示信息': 'show_info',
 }
 
 # ==================== 串口通信配置 ====================

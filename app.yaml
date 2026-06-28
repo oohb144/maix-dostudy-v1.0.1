@@ -1,9 +1,10 @@
 id: dostudy640
 name: 做中学640
-version: 2.0.0
+version: 5.0.1
 author: oohb144
 icon: app.png
-desc: 人脸识别智能系统检测自动录制熟人/陌生人标记网页端状态同步实时音频推流，640*480p，实现开关推流，实现音频融合音视频的录制与播放,识别同时音视频播放
+desc: >-
+  人脸识别智能系统检测自动录制熟人/陌生人标记网页端状态同步实时音频推流，640*480p，实现开关推流，实现音频融合音视频的录制与播放,识别同时音视频播放，d优化帧率，实现人名记录，实现了关键词识别，基于云端。音频播放差不多了人声，数据下发完成
 files:
   - audio_controller.py
   - audio_streamer.py
@@ -14,13 +15,16 @@ files:
   - main_k.py
   - main.py
   - main1.py
+  - online_voice_recognition.py
   - OPTIMIZATION_README.md
+  - probe_deps.py
   - README.md
   - recorder_manager.py
   - serial_comm.py
   - state_machine.py
   - status_server.py
   - stream_manager.py
+  - test_audio_play.py
   - test_performance.py
   - ui_pages.py
   - ui.py

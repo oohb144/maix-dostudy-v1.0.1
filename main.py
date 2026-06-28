@@ -20,6 +20,7 @@ MaixCAM2 人脸识别智能系统 - UI 版主程序
 
 from maix import camera, display, image, app, time, touchscreen
 import os
+import _thread
 
 # 导入自定义模块
 from config import (
@@ -42,6 +43,10 @@ from config import (
     TEXT_SCALE, STATUS_TEXT_X, STATUS_TEXT_Y,
     # 功能开关
     AUDIO_ENABLE, LED_ENABLE, VOICE_ENABLE, SERIAL_ENABLE,
+    AUTO_RECORD_ENABLE,
+    # 在线语音识别配置
+    ONLINE_VOICE_ENABLE, DASHSCOPE_API_KEY,
+    ONLINE_VOICE_SAMPLE_RATE, ONLINE_VOICE_KEYWORDS,
     # 推流配置
     STREAM_ENABLE, STREAM_WIDTH, STREAM_HEIGHT,
     # RTSP推流配置
@@ -50,6 +55,14 @@ from config import (
     VOICE_MODEL_PATH, AUDIO_DIR, VOICE_KEYWORDS,
     VOICE_PAUSE_WHEN_ACTIVE, VOICE_RUN_INTERVAL_MS,
     VOICE_PAUSE_SLEEP_MS, VOICE_KWS_GATE,
+    # 提示音效配置
+    SOUND_STRANGER, SOUND_KNOWN, SOUND_ENROLL_SUCCESS,
+    # 语音播报配置（固定中文语音 WAV，位于 /root/voice/）
+    VOICE_SYS_READY, VOICE_START_RECOGNIZE, VOICE_START_ENROLL, VOICE_ERROR,
+    VOICE_KNOWN, VOICE_STRANGER,
+    VOICE_CMD_HOME, VOICE_CMD_SETTINGS, VOICE_CMD_ENROLL, VOICE_CMD_RECORDINGS,
+    VOICE_CMD_START, VOICE_CMD_STOP,
+    VOICE_ENROLL_OK, VOICE_ENROLL_FAIL, VOICE_RECORD_SAVED, VOICE_READ_INFO_HINT,
     # 串口通信配置
     SERIAL_PORT, SERIAL_BAUDRATE, SERIAL_TX_PIN, SERIAL_RX_PIN,
     # 状态定义
@@ -76,6 +89,7 @@ from stream_manager import StreamManager, RtspStreamManager
 from audio_streamer import AudioStreamer
 from status_server import StatusServer
 from voice_recognition import VoiceRecognition
+from online_voice_recognition import OnlineVoiceRecognition
 from serial_comm import SerialComm, RecvCmd, SendCmd
 
 # 导入 UI 模块
@@ -98,11 +112,13 @@ class AppState:
         self.unknown_face_count = 0     # 当前帧未知人脸数
         self.face_labels = []           # 当前帧人脸标签列表
         self.record_duration = 0
+        self.keyboard_active = False    # 软键盘弹出时为 True，阻止覆盖缓存人脸帧
         self.stream_enable = STREAM_ENABLE
         self.stream_url = ""
         self.rtsp_enable = RTSP_ENABLE
         self.rtsp_url = ""
         self.audio_enable = AUDIO_ENABLE
+        self.auto_record_enable = AUTO_RECORD_ENABLE   # 自动录制开关（识别到人脸自动录制）
         self.led_enable = LED_ENABLE
         self.voice_enable = VOICE_ENABLE
         self.voice_status = "待机"
@@ -114,6 +130,7 @@ class AppState:
         self.fusion_items = []
         self.muxed_videos = []
         self.need_save = False
+        self.voice_recognition_active = False  # 语音识别是否已启动（由主程序按实际状态设置）
 
 
 class FaceRecognitionUI:
@@ -135,12 +152,11 @@ class FaceRecognitionUI:
 
         # ==================== 初始化硬件 ====================
         print("[系统] 初始化摄像头...")
-        # 使用 RGB888 格式，支持绘图操作
-        # 注：RTSP 推流有独立的摄像头实例，使用 YVU420SP 格式
         self._cam = camera.Camera(
             CAMERA_WIDTH, CAMERA_HEIGHT,
             image.Format.FMT_RGB888
         )
+        self._cam_rgb = self._cam  # 统一用 _cam_rgb 读帧，兼容 handler 里的调用
         # 跳过启动帧，提高稳定性
         self._cam.skip_frames(10)
 
@@ -185,15 +201,27 @@ class FaceRecognitionUI:
             self._audio = None
             print("[系统] 音频已禁用")
 
-        # 语音识别器
+        # 语音识别器（离线本机模型，占内存，默认关闭）
         self._voice_recognition = None
+        # 语音命令队列：回调在语音线程入队，主循环线程取出执行，避免并发竞争
+        self._voice_cmd_queue = []
+        self._voice_cmd_lock = _thread.allocate_lock()
         if VOICE_ENABLE:
-            print("[系统] 初始化语音识别器...")
+            print("[系统] 初始化离线语音识别器...")
             self._voice_recognition = VoiceRecognition(
                 VOICE_MODEL_PATH,
                 run_interval_ms=VOICE_RUN_INTERVAL_MS,
                 pause_sleep_ms=VOICE_PAUSE_SLEEP_MS,
                 kws_gate=VOICE_KWS_GATE
+            )
+            self._voice_recognition.set_pause_callback(
+                self._should_pause_voice_recognition
+            )
+        elif ONLINE_VOICE_ENABLE:
+            print("[系统] 初始化在线语音识别器(DashScope)...")
+            self._voice_recognition = OnlineVoiceRecognition(
+                api_key=DASHSCOPE_API_KEY,
+                sample_rate=ONLINE_VOICE_SAMPLE_RATE,
             )
             self._voice_recognition.set_pause_callback(
                 self._should_pause_voice_recognition
@@ -313,13 +341,21 @@ class FaceRecognitionUI:
         # 推入主页
         self._ui_manager.push(self._home_page)
 
-        # 启动语音识别
+        # 启动语音识别（在线优先，关键词随之切换）
         if self._voice_recognition:
-            print("[系统] 启动语音识别...")
-            self._voice_recognition.start(
-                keywords=VOICE_KEYWORDS,
-                callback=self._on_voice_command
-            )
+            if ONLINE_VOICE_ENABLE and not VOICE_ENABLE:
+                print("[系统] 启动在线语音识别...")
+                self._voice_recognition.start(
+                    keywords=ONLINE_VOICE_KEYWORDS,
+                    callback=self._on_voice_command
+                )
+            else:
+                print("[系统] 启动离线语音识别...")
+                self._voice_recognition.start(
+                    keywords=VOICE_KEYWORDS,
+                    callback=self._on_voice_command
+                )
+            self._app_state.voice_recognition_active = True
 
         # 启动串口通信
         if self._serial_comm:
@@ -363,6 +399,11 @@ class FaceRecognitionUI:
         self._enroll_message = ""
         self._last_face_type = 'none'  # 'none', 'known', 'unknown'
 
+        # 开机语音：仅首次进入 IDLE 播"系统已就绪"，日常回待机不重复播
+        self._first_idle = True
+        # show_info 信息浮层显示截止时间（0=不显示）
+        self._info_overlay_until = 0
+
         # 识别帧节流：每 N 帧才做一次重特征识别，画框每帧都跑
         self._last_recognize_frame = 0
         self._cached_label_boxes = []  # 缓存上次识别结果（位置 + 标签 + 已知/未知）
@@ -372,6 +413,9 @@ class FaceRecognitionUI:
 
         # 帧跳计数器（用于降低推流和状态推送频率）
         self._frame_count = 0
+
+        # 识别帧标志：handler 内跑了 detect_and_recognize 的帧置 True，主循环读后用于跳过推流
+        self._is_recognize_frame = False
 
         # 阈值变化检测（避免 hasattr 反模式）
         self._last_conf_threshold = FACE_CONF_THRESHOLD
@@ -399,7 +443,9 @@ class FaceRecognitionUI:
             on_enroll=self._on_enroll_click,
             on_settings=self._on_settings_click,
             on_record=self._on_record_click,
-            on_fusion=self._on_fusion_click
+            on_fusion=self._on_fusion_click,
+            on_voice_toggle=self._on_voice_recognition_toggle,
+            on_auto_record_toggle=self._on_auto_record_toggle
         )
 
         # 录入页按钮回调
@@ -470,6 +516,20 @@ class FaceRecognitionUI:
         self._app_state.stream_enable = not self._app_state.stream_enable
         self._sync_stream_settings()
 
+    def _on_voice_recognition_toggle(self):
+        """语音识别开关按钮点击"""
+        if not self._voice_recognition:
+            print("[UI] 语音识别未初始化，无法切换")
+            return
+        if self._app_state.voice_recognition_active:
+            self._voice_recognition.stop()
+            self._app_state.voice_recognition_active = False
+            print("[UI] 语音识别已关闭")
+        else:
+            self._voice_recognition.start()
+            self._app_state.voice_recognition_active = True
+            print("[UI] 语音识别已开启")
+
     def _on_fusion_click(self):
         """融合播放按钮点击"""
         current_state = self._state_machine.state
@@ -478,12 +538,27 @@ class FaceRecognitionUI:
         self._refresh_fusion_items("已读取融合列表")
         self._ui_manager.push(self._fusion_player_page)
 
-    def _on_enroll_face_click(self):
-        """录入人脸按钮点击"""
-        print(f"[录入] 点击录入按钮，当前状态: {self._state_machine.state}")
+    def _on_auto_record_toggle(self):
+        """自动录制开关按钮点击
+
+        开启：识别到人脸自动进入录制（默认行为）
+        关闭：识别到人脸只播放音效、不录制，留在识别态
+        """
+        self._app_state.auto_record_enable = not self._app_state.auto_record_enable
+        on = self._app_state.auto_record_enable
+        print(f"[UI] 自动录制已{'开启' if on else '关闭'}")
+        # 关闭自动录制时，若当前正在自动录制，则退回识别态（停止录制但保持识别）
+        if not on and self._state_machine.state == State.RECORDING:
+            self._state_machine.transition(State.RECOGNIZING)
+            # 重置人脸类型，使后续识别能正常播音效
+            self._last_face_type = 'none'
+
+    def _on_enroll_face_click(self, name=None):
+        """录入人脸按钮点击（name 由软键盘传入，为 None 时自动生成）"""
+        print(f"[录入] 点击录入按钮，当前状态: {self._state_machine.state}, 名字: {name}")
         # 只有在 ENROLLING 状态下才允许录入
         if self._state_machine.state == State.ENROLLING:
-            self._do_enroll_face()
+            self._do_enroll_face(name=name)
         else:
             print(f"[录入] 当前不在录入模式，忽略点击")
 
@@ -510,12 +585,37 @@ class FaceRecognitionUI:
 
     def _on_voice_command(self, command):
         """
-        语音命令回调函数
+        语音命令回调（运行在语音识别线程）
+
+        仅入队，由主循环线程取出执行，避免与主循环并发产生竞争。
 
         参数：
             command: 命令名
         """
-        print(f"[语音] 收到命令: {command}")
+        with self._voice_cmd_lock:
+            self._voice_cmd_queue.append(command)
+        print(f"[语音] 收到命令(入队): {command}")
+
+    def _process_voice_commands(self):
+        """主循环中调用：取出并执行队列里的语音命令"""
+        while True:
+            with self._voice_cmd_lock:
+                if not self._voice_cmd_queue:
+                    return
+                command = self._voice_cmd_queue.pop(0)
+            try:
+                self._dispatch_voice_command(command)
+            except Exception as e:
+                print(f"[语音] 命令执行异常: {e}")
+
+    def _dispatch_voice_command(self, command):
+        """
+        执行语音命令（运行在主循环线程）
+
+        参数：
+            command: 命令名
+        """
+        print(f"[语音] 执行命令: {command}")
 
         current_state = self._state_machine.state
 
@@ -527,12 +627,14 @@ class FaceRecognitionUI:
             if current_state not in (State.IDLE,):
                 self._state_machine.transition(State.IDLE)
             print("[语音] 切换到主页")
+            self._audio_play('play_wav_file', file_path=VOICE_CMD_HOME)
 
         elif command == 'settings':
             # 切换到设置页
             if len(self._ui_manager.page_stack) == 1:
                 self._ui_manager.push(self._settings_page)
             print("[语音] 切换到设置页")
+            self._audio_play('play_wav_file', file_path=VOICE_CMD_SETTINGS)
 
         elif command == 'enroll':
             # 切换到录入页
@@ -541,12 +643,37 @@ class FaceRecognitionUI:
                 if len(self._ui_manager.page_stack) == 1:
                     self._ui_manager.push(self._enroll_page)
             print("[语音] 切换到录入页")
+            # 回声确认由 _on_enter_enrolling 的 start_enroll 语音承担
 
         elif command == 'recordings':
             # 切换到录像页
             if len(self._ui_manager.page_stack) == 1:
                 self._ui_manager.push(self._recordings_page)
             print("[语音] 切换到录像页")
+            self._audio_play('play_wav_file', file_path=VOICE_CMD_RECORDINGS)
+
+        # 播放/融合界面命令
+        elif command == 'fusion_page':
+            # 进入融合播放界面
+            if len(self._ui_manager.page_stack) == 1:
+                self._on_fusion_click()
+            print("[语音] 进入播放界面")
+
+        elif command == 'fusion_mux':
+            # 开始融合（仅在播放界面时有效）
+            if self._ui_manager.get_current_page() is self._fusion_player_page:
+                self._on_fusion_mux()
+                print("[语音] 开始融合")
+            else:
+                print("[语音] 不在播放界面，忽略融合命令")
+
+        elif command == 'fusion_play':
+            # 播放选中的融合视频（仅在播放界面时有效）
+            if self._ui_manager.get_current_page() is self._fusion_player_page:
+                self._on_fusion_play()
+                print("[语音] 开始播放融合视频")
+            else:
+                print("[语音] 不在播放界面，忽略播放命令")
 
         # 功能控制命令
         elif command == 'recognize':
@@ -554,6 +681,7 @@ class FaceRecognitionUI:
             if current_state == State.IDLE:
                 self._state_machine.transition(State.RECOGNIZING)
             print("[语音] 开始识别")
+            # 回声确认由 _on_enter_recognizing 的 start_recognize 语音承担，避免与进入音抢播放锁
 
         elif command == 'stop':
             # 停止当前操作
@@ -562,25 +690,51 @@ class FaceRecognitionUI:
             elif current_state == State.ENROLLING:
                 self._state_machine.transition(State.IDLE)
             print("[语音] 停止操作")
+            # transition() 已先停录音器，再播"已停止"避免抢设备
+            self._audio_play('play_wav_file', file_path=VOICE_CMD_STOP)
+
+        elif command == 'auto_record_on':
+            # 打开自动录制
+            was_off = not self._app_state.auto_record_enable
+            self._app_state.auto_record_enable = True
+            if was_off and current_state == State.RECOGNIZING:
+                self._last_face_type = 'none'  # 触发下一次检测转入录制
+            print("[语音] 自动录制已开启")
+
+        elif command == 'auto_record_off':
+            # 关闭自动录制
+            was_on = self._app_state.auto_record_enable
+            self._app_state.auto_record_enable = False
+            # 正在录制时退回识别态（停止录制但继续识别并播音效）
+            if was_on and current_state == State.RECORDING:
+                self._state_machine.transition(State.RECOGNIZING)
+                self._last_face_type = 'none'
+            print("[语音] 自动录制已关闭")
 
         elif command == 'start':
             # 开始识别
             if current_state == State.IDLE:
                 self._state_machine.transition(State.RECOGNIZING)
             print("[语音] 开始识别")
+            # 回声确认由 _on_enter_recognizing 的 start_recognize 语音承担
 
         # 信息查询命令
-        elif command in ('read_info', 'show_info'):
-            # 读取系统信息
+        elif command == 'read_info':
+            # 读取系统信息：语音提示看屏幕（固定 WAV 念不了动态人数，故用提示音引导）
             face_count = self._face_detector.get_class_count()
             state_name = STATE_NAMES.get(current_state, '未知')
-
             info = f"当前状态: {state_name}, 已录入人脸: {face_count}人"
             print(f"[语音] 系统信息: {info}")
+            self._audio_play('play_wav_file', file_path=VOICE_READ_INFO_HINT)
+            # 同时在屏幕显示信息浮层 3 秒
+            self._info_overlay_until = time.ticks_ms() + 3000
 
-            # 播放提示音
-            if self._audio:
-                self._audio.play_transition()
+        elif command == 'show_info':
+            # 显示系统信息：屏幕绘制信息浮层 3 秒（无语音）
+            face_count = self._face_detector.get_class_count()
+            state_name = STATE_NAMES.get(current_state, '未知')
+            print(f"[语音] 显示系统信息: 当前状态={state_name}, 已录入人脸={face_count}人")
+            self._info_overlay_until = time.ticks_ms() + 3000
 
         # 音频播放命令
         elif command == 'play_audio':
@@ -678,6 +832,167 @@ class FaceRecognitionUI:
 
         else:
             print(f"[串口] 未知命令: {cmd_id:#04x}")
+
+    # ==================== 上位机远程命令（HTTP POST /command） ====================
+
+    def _process_remote_commands(self):
+        """主循环中调用：取出并执行上位机（播放器）下发的远程指令队列。"""
+        if not getattr(self, '_status_server', None):
+            return
+        while True:
+            payload = self._status_server.pop_command()
+            if payload is None:
+                return
+            try:
+                self._dispatch_remote_command(payload)
+            except Exception as e:
+                print(f"[远程] 命令执行异常: {e}")
+
+    def _dispatch_remote_command(self, payload):
+        """
+        执行上位机下发的远程指令（运行在主循环线程，线程安全）。
+
+        指令协议见《K230下发协议文档》。payload 形如：
+            {"cmd": "start_recognize"}
+            {"cmd": "rtsp", "value": true}
+            {"cmd": "set_threshold", "key": "conf_threshold", "value": 0.30}
+
+        参数：
+            payload: dict，至少含 'cmd' 字段
+        """
+        cmd = payload.get('cmd')
+        value = payload.get('value')
+        current_state = self._state_machine.state
+        print(f"[远程] 执行命令: {cmd} value={value}")
+
+        # —— 主操作：识别 / 录入 / 录制 ——
+        if cmd == 'start_recognize':
+            if current_state == State.IDLE:
+                self._state_machine.transition(State.RECOGNIZING)
+
+        elif cmd == 'stop_recognize':
+            if current_state in (State.RECOGNIZING, State.RECORDING,
+                                 State.MANUAL_RECORDING, State.ENROLLING):
+                self._state_machine.transition(State.IDLE)
+
+        elif cmd == 'start_enroll':
+            if current_state == State.IDLE:
+                self._state_machine.transition(State.ENROLLING)
+                if len(self._ui_manager.page_stack) == 1:
+                    self._ui_manager.push(self._enroll_page)
+
+        elif cmd == 'stop_enroll':
+            if current_state == State.ENROLLING:
+                self._state_machine.transition(State.IDLE)
+
+        elif cmd == 'start_record':
+            if current_state == State.IDLE:
+                self._state_machine.transition(State.MANUAL_RECORDING)
+
+        elif cmd == 'stop_record':
+            if current_state in (State.RECORDING, State.MANUAL_RECORDING):
+                self._state_machine.transition(State.IDLE)
+
+        elif cmd == 'enroll_face':
+            # 仅在录入态执行人脸采集（与短按 OK 一致）
+            if current_state == State.ENROLLING:
+                self._do_enroll_face()
+
+        # —— 页面跳转 ——
+        elif cmd == 'go_home':
+            while len(self._ui_manager.page_stack) > 1:
+                self._ui_manager.pop()
+            if current_state != State.IDLE:
+                self._state_machine.transition(State.IDLE)
+
+        elif cmd == 'go_settings':
+            if len(self._ui_manager.page_stack) == 1:
+                self._ui_manager.push(self._settings_page)
+
+        elif cmd == 'go_enroll_page':
+            if current_state in (State.RECOGNIZING, State.RECORDING,
+                                 State.MANUAL_RECORDING):
+                self._state_machine.transition(State.IDLE)
+            if len(self._ui_manager.page_stack) == 1:
+                self._ui_manager.push(self._enroll_page)
+
+        elif cmd == 'fusion_page':
+            if len(self._ui_manager.page_stack) == 1:
+                self._on_fusion_click()
+
+        elif cmd == 'recordings_page':
+            if len(self._ui_manager.page_stack) == 1:
+                self._ui_manager.push(self._recordings_page)
+
+        # —— 设备开关（带 value: true/false） ——
+        elif cmd == 'http_stream':
+            if value:
+                if self._stream_manager and not self._stream_manager.is_streaming():
+                    self._stream_manager.start()
+                    self._app_state.stream_enable = True
+                    self._app_state.stream_url = self._stream_manager.get_stream_url()
+            else:
+                if self._stream_manager and self._stream_manager.is_streaming():
+                    self._stream_manager.stop()
+                    self._app_state.stream_enable = False
+
+        elif cmd == 'rtsp':
+            # 改 app_state 标志，由 _sync_stream_settings 在主循环统一同步启停
+            self._app_state.rtsp_enable = bool(value)
+
+        elif cmd == 'audio':
+            self._app_state.audio_enable = bool(value)
+
+        elif cmd == 'led':
+            self._app_state.led_enable = bool(value)
+
+        elif cmd == 'voice':
+            if self._voice_recognition:
+                if value and not self._app_state.voice_recognition_active:
+                    self._voice_recognition.start()
+                    self._app_state.voice_recognition_active = True
+                elif not value and self._app_state.voice_recognition_active:
+                    self._voice_recognition.stop()
+                    self._app_state.voice_recognition_active = False
+
+        elif cmd == 'auto_record':
+            was = self._app_state.auto_record_enable
+            self._app_state.auto_record_enable = bool(value)
+            if value and not was and current_state == State.RECOGNIZING:
+                self._last_face_type = 'none'  # 触发下一次检测转入录制
+            elif not value and was and current_state == State.RECORDING:
+                self._state_machine.transition(State.RECOGNIZING)
+                self._last_face_type = 'none'
+
+        # —— 阈值调节 ——
+        elif cmd == 'set_threshold':
+            key = payload.get('key')
+            try:
+                fv = float(value)
+            except Exception:
+                fv = None
+            if fv is not None:
+                fv = max(0.10, min(0.90, fv))
+                if key == 'conf_threshold':
+                    self._app_state.conf_threshold = fv
+                elif key == 'recognize_threshold':
+                    self._app_state.recognize_threshold = fv
+                # 立即同步到检测器（也会在主循环每 30 帧兜底同步）
+                self._check_threshold_update()
+
+        # —— 危险操作 ——
+        elif cmd == 'clear_faces':
+            self._face_detector.clear_all_faces()
+            self._update_face_list()
+
+        elif cmd == 'clear_recordings':
+            self._on_clear_recordings()
+
+        elif cmd == 'exit_app':
+            app.set_exit_flag(True)
+
+        else:
+            print(f"[远程] 未知命令: {cmd}")
 
     def _on_delete_face_click(self):
         """删除人脸按钮点击"""
@@ -904,6 +1219,31 @@ class FaceRecognitionUI:
             if method:
                 method(**kwargs)
 
+    def _draw_info_overlay(self, img):
+        """绘制系统信息浮层（show_info / read_info 触发，显示 3 秒）
+
+        在屏幕中上方绘制半透明信息条，含当前状态与已录入人数。
+        复用 STATE_NAMES 与 face_detector.get_class_count()。
+        """
+        if self._info_overlay_until == 0:
+            return
+        current_time = time.ticks_ms()
+        remaining_ms = self._info_overlay_until - current_time
+        if remaining_ms <= 0:
+            self._info_overlay_until = 0
+            return
+        try:
+            state_name = STATE_NAMES.get(self._state_machine.state, '未知')
+            face_count = self._face_detector.get_class_count() if self._face_detector else 0
+            info = f"状态:{state_name}  已录入:{face_count}人"
+            # 半透明黑色底条（两条错位描边 + 实心条，增强可读性）
+            y = self._cam_rgb.height() // 2 - 30
+            img.draw_rect(20, y, img.width() - 40, 60, color=(0, 0, 0), thickness=-1)
+            img.draw_string(40, y + 18, info, color=(255, 255, 255), scale=1.2)
+        except Exception as e:
+            print(f"[信息浮层] 绘制失败: {e}")
+            self._info_overlay_until = 0
+
     # ==================== 按键回调函数 ====================
     def _on_short_press(self):
         """短按 OK 键回调"""
@@ -944,8 +1284,13 @@ class FaceRecognitionUI:
         print("[状态] 进入空闲模式")
         self._app_state.state = State.IDLE
         self._led_blink(LED_BLINK_IDLE)
+        # 仅开机首次进入空闲播"系统已就绪"，日常回待机不重复播
+        if self._first_idle:
+            self._first_idle = False
+            self._audio_play('play_wav_file', file_path=VOICE_SYS_READY)
         self._no_face_time = 0
         self._cached_faces = []
+        self._cached_label_boxes = []  # 清空缓存框
         self._cached_identity_label = "未知"
         self._cached_identity_known = False
         self._cached_img = None
@@ -959,12 +1304,13 @@ class FaceRecognitionUI:
         self._led_blink(LED_BLINK_FAST)
         # 只有从非录制状态进入时才播提示音，避免每次人脸消失后反复响
         if prev != State.RECORDING:
-            self._audio_play('play_double_beep')
+            self._audio_play('play_wav_file', file_path=VOICE_START_RECOGNIZE)
         self._no_face_time = 0
         self._last_alarm_time = 0
         self._last_success_time = 0
         self._last_recognize_detect_time = 0
         self._cached_faces = []
+        self._cached_label_boxes = []  # 清空缓存框，避免误触发 RECORDING
         self._cached_identity_label = "未知"
         self._cached_identity_known = False
 
@@ -974,6 +1320,9 @@ class FaceRecognitionUI:
         self._app_state.state = State.RECORDING
         self._led_blink(LED_BLINK_SLOW)
         self._last_record_recognize_time = 0
+        # 等待音效播放完毕，避免 audio.Player 与 audio.Recorder 争用设备
+        if self._audio:
+            self._audio.wait_for_completion(timeout_ms=800)
         self._recorder.start_recording(self._cam, with_audio=True)
 
     def _on_enter_manual_recording(self):
@@ -989,6 +1338,9 @@ class FaceRecognitionUI:
         self._cached_faces = []
         self._cached_identity_label = "未知"
         self._cached_identity_known = False
+        # 等待音效播放完毕
+        if self._audio:
+            self._audio.wait_for_completion(timeout_ms=800)
         self._recorder.start_recording(self._cam, with_audio=True)
 
     def _on_enter_enrolling(self):
@@ -996,7 +1348,7 @@ class FaceRecognitionUI:
         print("[状态] 进入录入模式，state=ENROLLING(2)")
         self._app_state.state = State.ENROLLING
         self._led_blink(LED_BLINK_FAST)
-        self._audio_play('play_transition', freq=TRANSITION_FREQ, duration=TRANSITION_DURATION)
+        self._audio_play('play_wav_file', file_path=VOICE_START_ENROLL)
         self._cached_faces = []
         self._cached_img = None
 
@@ -1005,7 +1357,7 @@ class FaceRecognitionUI:
         print("[状态] 进入错误状态")
         self._app_state.state = State.ERROR
         self._led_blink(LED_BLINK_FAST)
-        self._audio_play('play_error')
+        self._audio_play('play_wav_file', file_path=VOICE_ERROR)
 
     # ==================== 状态退出回调 ====================
     def _on_exit_recognizing(self):
@@ -1020,6 +1372,8 @@ class FaceRecognitionUI:
             print(f"[录制] 视频文件: {video_path}")
             print(f"[录制] 音频文件: {audio_path}")
             self._update_recordings_list()
+            # 录音器已 stop，安全播报"录制已保存"
+            self._audio_play('play_wav_file', file_path=VOICE_RECORD_SAVED)
 
     def _on_exit_manual_recording(self):
         """退出手动纯录制状态"""
@@ -1046,7 +1400,7 @@ class FaceRecognitionUI:
         - 空闲状态用于提高帧率，减少 CPU 负载
         - 只在需要时（进入识别或录入状态）才进行人脸识别
         """
-        img = self._cam.read()
+        img = self._cam_rgb.read()
 
         # 空闲状态不进行人脸识别，保持低负载
         # 人脸检测只在 RECOGNIZING 和 ENROLLING 状态进行
@@ -1062,40 +1416,57 @@ class FaceRecognitionUI:
 
     def _handle_recognizing(self):
         """
-        识别状态处理（高帧率版）：
-        - 每帧轻量检测画框，框跟随画面
-        - 每 5 帧才做一次重识别更新标签
+        识别状态处理：
+        - 每帧都跑 detect_and_recognize，框实时跟人
+        - 达到标签刷新间隔时才更新名字缓存，降低身份比对频率
         - 检测到人脸后转换到录制状态
         """
-        img = self._cam.read()
-        faces = self._face_detector.detect_faces_only(img)
+        img = self._cam_rgb.read()
+        self._is_recognize_frame = False
 
-        if faces:
-            # 重识别节流：每 5 帧才跑一次完整识别
-            if (self._frame_count - self._last_recognize_frame) >= 5:
-                recognized_faces = self._face_detector.detect_and_recognize(img)
+        # 判断本帧是否需要刷新标签（身份识别节流）
+        _has_cached_known = any(c.get('is_known') for c in self._cached_label_boxes) if self._cached_label_boxes else False
+        label_interval = 20 if _has_cached_known else 5
+        should_update_label = (self._frame_count - self._last_recognize_frame) >= label_interval
+
+        # 每帧都跑检测，保证框实时跟人
+        detected_faces = self._face_detector.detect_and_recognize(img)
+
+        if detected_faces:
+            if should_update_label:
+                # 刷新标签缓存
+                self._is_recognize_frame = True
                 self._last_recognize_frame = self._frame_count
                 self._cached_label_boxes = []
-                for f in recognized_faces:
+                for f in detected_faces:
                     self._cached_label_boxes.append({
                         'x': f.x, 'y': f.y, 'w': f.w, 'h': f.h,
                         'label': self._face_detector.get_face_label(f),
                         'is_known': self._face_detector.is_known_face(f),
                     })
+            else:
+                # 只更新位置，保留上次的标签（通过中心点匹配）
+                new_boxes = []
+                for f in detected_faces:
+                    matched = self._match_cached_label(f)
+                    new_boxes.append({
+                        'x': f.x, 'y': f.y, 'w': f.w, 'h': f.h,
+                        'label': matched['label'] if matched else "未知",
+                        'is_known': matched['is_known'] if matched else False,
+                    })
+                self._cached_label_boxes = new_boxes
 
-            # 用缓存标签贴到当前轻量检测框上
             current_labels = []
             has_known = False
-            for face in faces:
-                cached = self._match_cached_label(face)
-                color = image.COLOR_GREEN if cached and cached['is_known'] else image.COLOR_RED
-                label = cached['label'] if cached and cached['is_known'] else "未知"
-                if cached and cached['is_known']:
+            for c in self._cached_label_boxes:
+                color = image.COLOR_GREEN if c['is_known'] else image.COLOR_RED
+                label = c['label'] if c['is_known'] else "未知"
+                if c['is_known']:
                     has_known = True
                 current_labels.append(label)
-                img.draw_rect(face.x, face.y, face.w, face.h, color=color, thickness=2)
+                img.draw_rect(c['x'], c['y'], c['w'], c['h'], color=color, thickness=2)
                 if label:
-                    img.draw_string(face.x, max(0, face.y - 22), label, color=color, scale=1.0)
+                    img.draw_string(c['x'], max(0, c['y'] - 22), label, color=color, scale=1.0)
 
             self._processed_img = img
             self._cached_identity_known = has_known
@@ -1103,18 +1474,31 @@ class FaceRecognitionUI:
                 (l for l in current_labels if l != "未知"), "未知"
             )
 
-            # 更新人脸详情数据
             known_count = sum(1 for l in current_labels if l != "未知")
-            self._app_state.face_count = len(faces)
+            self._app_state.face_count = len(self._cached_label_boxes)
             self._app_state.known_face_count = known_count
-            self._app_state.unknown_face_count = len(faces) - known_count
+            self._app_state.unknown_face_count = len(self._cached_label_boxes) - known_count
             self._app_state.face_labels = current_labels
 
-            # 转换到录制状态
-            self._state_machine.transition(State.RECORDING)
+            # 只有关闭自动录制时才在识别态播音效：
+            #   开启自动录制时检测到人脸要转入录制，播音效会与随后启动的录音器抢设备，故不播
+            #   关闭自动录制时停留在识别态，熟人↔陌生人切换可反复触发音效
+            if not self._app_state.auto_record_enable:
+                face_type = 'known' if has_known else 'unknown'
+                if self._last_face_type != face_type:
+                    if has_known:
+                        self._audio_play('play_wav_file', file_path=VOICE_KNOWN)
+                    else:
+                        self._audio_play('play_wav_file', file_path=VOICE_STRANGER)
+                    self._last_face_type = face_type
+
+            # 只有开启自动录制时，才转入录制态；否则留在识别态继续识别/播音效
+            if self._app_state.auto_record_enable:
+                self._state_machine.transition(State.RECORDING)
             return
 
-        # 未检测到人脸，持续等待
+        # 未检测到人脸
+        self._cached_label_boxes = []
         img.draw_string(10, 40, "等待人脸...",
                        color=image.COLOR_YELLOW, scale=TEXT_SCALE)
 
@@ -1128,73 +1512,83 @@ class FaceRecognitionUI:
 
     def _handle_recording(self):
         """
-        录制状态处理（高帧率版）：
-        - 每帧轻量检测人脸位置（detect_faces_only），保证框跟随画面
-        - 每 RECOGNIZE_INTERVAL_FRAMES 帧才做一次重识别（detect_and_recognize）更新标签
-        - 通过 IoU 匹配把缓存的标签贴到当前轻量检测框上
+        录制状态处理：
+        - 每帧都跑检测，框实时跟人，录制画面带框
+        - 达到标签刷新间隔才更新名字缓存
         - 无人脸 3 秒后停止录制并返回识别状态
         """
-        img = self._cam.read()
+        img = self._cam_rgb.read()
         current_time = time.ticks_ms()
+        self._is_recognize_frame = False
 
-        # 1) 轻量检测：每帧都跑，画框跟随画面
-        light_faces = self._face_detector.detect_faces_only(img)
+        # 标签刷新间隔
+        _has_cached_known = any(c.get('is_known') for c in self._cached_label_boxes) if self._cached_label_boxes else False
+        label_interval = 20 if _has_cached_known else 5
+        should_update_label = (self._frame_count - self._last_recognize_frame) >= label_interval
 
-        # 2) 重识别：每 N 帧跑一次，刷新缓存的身份信息
-        recognize_interval = 5  # 每 5 帧重识别一次
-        if light_faces and (self._frame_count - self._last_recognize_frame) >= recognize_interval:
-            recognized_faces = self._face_detector.detect_and_recognize(img)
-            self._last_recognize_frame = self._frame_count
-            # 缓存识别结果（位置 + 标签 + 已知/未知）
-            self._cached_label_boxes = []
-            for f in recognized_faces:
-                self._cached_label_boxes.append({
-                    'x': f.x, 'y': f.y, 'w': f.w, 'h': f.h,
-                    'label': self._face_detector.get_face_label(f),
-                    'is_known': self._face_detector.is_known_face(f),
-                })
+        # 每帧都跑检测
+        detected_faces = self._face_detector.detect_and_recognize(img)
 
-        if light_faces:
-            # 检测到人脸，重置无人脸计时
+        if detected_faces:
             self._no_face_time = 0
 
-            # 3) IoU 匹配：把缓存的标签贴到当前轻量检测框上
+            if should_update_label:
+                self._is_recognize_frame = True
+                self._last_recognize_frame = self._frame_count
+                self._cached_label_boxes = []
+                for f in detected_faces:
+                    self._cached_label_boxes.append({
+                        'x': f.x, 'y': f.y, 'w': f.w, 'h': f.h,
+                        'label': self._face_detector.get_face_label(f),
+                        'is_known': self._face_detector.is_known_face(f),
+                    })
+            else:
+                # 只更新位置，保留标签
+                new_boxes = []
+                for f in detected_faces:
+                    matched = self._match_cached_label(f)
+                    new_boxes.append({
+                        'x': f.x, 'y': f.y, 'w': f.w, 'h': f.h,
+                        'label': matched['label'] if matched else "未知",
+                        'is_known': matched['is_known'] if matched else False,
+                    })
+                self._cached_label_boxes = new_boxes
+
             has_known = False
             current_labels = []
-            for face in light_faces:
-                cached = self._match_cached_label(face)
-                color = image.COLOR_GREEN if cached and cached['is_known'] else image.COLOR_RED
-                label = cached['label'] if cached and cached['is_known'] else "未知"
-                if cached and cached['is_known']:
+            for c in self._cached_label_boxes:
+                color = image.COLOR_GREEN if c['is_known'] else image.COLOR_RED
+                label = c['label'] if c['is_known'] else "未知"
+                if c['is_known']:
                     has_known = True
                 current_labels.append(label)
-                # 直接用 image.draw_rect 比走 face_detector.draw_face 更轻
-                img.draw_rect(face.x, face.y, face.w, face.h, color=color, thickness=2)
+                img.draw_rect(c['x'], c['y'], c['w'], c['h'], color=color, thickness=2)
                 if label:
-                    img.draw_string(face.x, max(0, face.y - 22), label, color=color, scale=1.0)
+                    img.draw_string(c['x'], max(0, c['y'] - 22), label, color=color, scale=1.0)
 
-            # 串口通知（状态变化时发一次）
-            if self._serial_comm and self._serial_comm.is_running():
-                face_type = 'known' if has_known else 'unknown'
-                if self._last_face_type != face_type:
+            # 人脸类型变化时：串口通知（各触发一次）
+            # 注：音效只在 RECOGNIZING 状态播放，避免与录音抢占音频设备
+            face_type = 'known' if has_known else 'unknown'
+            if self._last_face_type != face_type:
+                if self._serial_comm and self._serial_comm.is_running():
                     if has_known:
                         self._serial_comm.send_known_face()
                     else:
                         self._serial_comm.send_unknown_face()
-                    self._last_face_type = face_type
+                self._last_face_type = face_type
 
-            # 更新应用状态
             self._app_state.has_face = True
-            self._app_state.face_count = len(light_faces)
+            self._app_state.face_count = len(self._cached_label_boxes)
             self._app_state.known_face_count = sum(1 for l in current_labels if l != "未知")
-            self._app_state.unknown_face_count = len(light_faces) - self._app_state.known_face_count
+            self._app_state.unknown_face_count = len(self._cached_label_boxes) - self._app_state.known_face_count
             self._app_state.face_labels = current_labels
 
             if self._recorder.is_recording():
                 self._app_state.record_duration = self._recorder.get_recording_duration() // 1000
 
         else:
-            # 未检测到人脸
+            # 没检测到人脸
+            self._cached_label_boxes = []
             self._app_state.has_face = False
             self._app_state.face_count = 0
             self._app_state.known_face_count = 0
@@ -1214,7 +1608,7 @@ class FaceRecognitionUI:
             img.draw_string(10, 40, f"人脸消失，{remaining}s后停止录制",
                            color=image.COLOR_YELLOW, scale=TEXT_SCALE)
 
-        # 编码当前录制画面
+        # 编码当前录制画面（带框）
         self._recorder.encode_frame(img)
         self._processed_img = img
 
@@ -1248,7 +1642,7 @@ class FaceRecognitionUI:
         - 仅采集当前画面并编码音视频
         - 更新录制时长用于 UI 显示
         """
-        img = self._cam.read()
+        img = self._cam_rgb.read()
 
         self._app_state.has_face = False
         self._app_state.face_count = 0
@@ -1257,48 +1651,12 @@ class FaceRecognitionUI:
         self._app_state.face_labels = []
 
         if self._recorder.is_recording():
-            self._recorder.encode_frame(img)
+            self._recorder.encode_frame(img)  # 录制器内部做 RGB→YUV 转换
             self._app_state.record_duration = self._recorder.get_recording_duration() // 1000
         else:
             self._app_state.record_duration = 0
 
         self._processed_img = img
-
-    def _process_face(self, img, face, has_known_face):
-        """处理检测到的人脸"""
-        label = self._face_detector.get_face_label(face)
-
-        if self._face_detector.is_known_face(face):
-            self._face_detector.draw_face(img, face,
-                                         color=image.COLOR_GREEN,
-                                         label=label)
-            self._led_on()
-
-            # 串口发送熟人通知（只在状态变化时发送一次）
-            if self._serial_comm and self._serial_comm.is_running():
-                if self._last_face_type != 'known':
-                    self._serial_comm.send_known_face()
-                    self._last_face_type = 'known'
-
-            current_time = time.ticks_ms()
-            if current_time - self._last_success_time > SUCCESS_COOLDOWN_MS:
-                self._last_success_time = current_time
-        else:
-            self._face_detector.draw_face(img, face,
-                                         color=image.COLOR_RED,
-                                         label="未知")
-
-            # 串口发送陌生人通知（只在状态变化时发送一次）
-            if self._serial_comm and self._serial_comm.is_running():
-                if self._last_face_type != 'unknown':
-                    self._serial_comm.send_unknown_face()
-                    self._last_face_type = 'unknown'
-
-            if not has_known_face:
-                current_time = time.ticks_ms()
-                if current_time - self._last_alarm_time > ALARM_COOLDOWN_MS:
-                    self._last_alarm_time = current_time
-                    self._led_blink(LED_BLINK_FAST)
 
     def _handle_enrolling(self):
         """
@@ -1307,15 +1665,16 @@ class FaceRecognitionUI:
         - 检测人脸并缓存结果
         - 显示引导信息
         """
-        img = self._cam.read()
-        self._cached_img = img
+        img = self._cam_rgb.read()
 
-        # 使用快速检测模式
-        faces = self._face_detector.detect_faces_only(img)
-        self._cached_faces = faces
-
-        # 更新应用状态
-        self._app_state.has_face = len(faces) > 0
+        # 键盘弹出期间不更新缓存：保留点击录入按钮时那一帧的人脸
+        if not self._app_state.keyboard_active:
+            self._cached_img = img
+            faces = self._face_detector.detect_faces_only(img)
+            self._cached_faces = faces
+            self._app_state.has_face = len(faces) > 0
+        else:
+            faces = self._cached_faces  # 继续用锁住的缓存
 
         # 调试信息（每10帧打印一次，避免刷屏）
         self._enroll_frame_count += 1
@@ -1350,8 +1709,12 @@ class FaceRecognitionUI:
         # 保存处理后的图像
         self._processed_img = img
 
-    def _do_enroll_face(self):
-        """执行人脸录入"""
+    def _do_enroll_face(self, name=None):
+        """执行人脸录入
+
+        参数：
+            name: 用户通过软键盘输入的名字，为 None 时自动生成
+        """
         try:
             face_count = len(self._cached_faces) if self._cached_faces else 0
             has_img = self._cached_img is not None
@@ -1363,10 +1726,15 @@ class FaceRecognitionUI:
                 self._enroll_success = False
                 self._enroll_message = "未检测到人脸"
                 self._enroll_show_time = time.ticks_ms()
+                self._audio_play('play_wav_file', file_path=VOICE_ENROLL_FAIL)
                 return
 
             face = self._cached_faces[0]
-            label = f"user_{time.ticks_ms() // 1000}"
+            # 优先使用用户输入的名字，否则回退到递增 ID
+            if name and name.strip():
+                label = name.strip()
+            else:
+                label = f"user_{self._face_detector.get_class_count() + 1}"
             print(f"[录入] 生成标签: {label}")
             print(f"[录入] 人脸信息: x={face.x}, y={face.y}, w={face.w}, h={face.h}")
 
@@ -1386,7 +1754,7 @@ class FaceRecognitionUI:
 
                 if success:
                     print(f"[录入] 成功: {message}")
-                    self._audio_play('play_double_beep')
+                    self._audio_play('play_wav_file', file_path=VOICE_ENROLL_OK)
                     self._led_blink(100)
 
                     self._enroll_success = True
@@ -1396,7 +1764,7 @@ class FaceRecognitionUI:
                     self._update_face_list()
                 else:
                     print(f"[录入] 失败: {message}")
-                    self._audio_play('play_error')
+                    self._audio_play('play_wav_file', file_path=VOICE_ENROLL_FAIL)
 
                     self._enroll_success = False
                     self._enroll_message = f"录入失败: {message}"
@@ -1406,6 +1774,7 @@ class FaceRecognitionUI:
                 self._enroll_success = False
                 self._enroll_message = "无法开始录入"
                 self._enroll_show_time = time.ticks_ms()
+                self._audio_play('play_wav_file', file_path=VOICE_ENROLL_FAIL)
 
             # 清除缓存
             self._cached_faces = []
@@ -1426,7 +1795,7 @@ class FaceRecognitionUI:
 
     def _handle_error(self):
         """错误状态处理"""
-        img = self._cam.read()
+        img = self._cam_rgb.read()
         self._processed_img = img
 
     # ==================== 主循环 ====================
@@ -1479,6 +1848,12 @@ class FaceRecognitionUI:
                         self._check_threshold_update()
                         self._sync_stream_settings()
 
+                    # 5.9 处理语音命令队列（在主线程执行，避免并发竞争）
+                    self._process_voice_commands()
+
+                    # 5.9.1 处理上位机（播放器）下发的远程指令（同样在主线程执行）
+                    self._process_remote_commands()
+
                     # 6. 业务状态处理（会更新 self._processed_img）
                     self._state_machine.update()
 
@@ -1506,17 +1881,22 @@ class FaceRecognitionUI:
                     if self._processed_img is not None:
                         img = self._processed_img
                     else:
-                        img = self._cam.read()
+                        img = self._cam_rgb.read()
 
                     # 8. UI 页面绘制（叠加按钮、状态栏等）
                     self._ui_manager.update(img)
 
+                    # 8.5 信息查询浮层（show_info/read_info 触发，显示 3 秒）
+                    self._draw_info_overlay(img)
+
                     # 9. 显示图像
                     self._disp.show(img)
 
-                    # 10. 推流（保持配置帧跳，避免音频开启时网页视频帧率突降）
+                    # 10. 推流：识别帧（重型 NPU 推理帧）跳过 JPEG 编码，避免两个重型操作叠加
                     stream_skip = STREAM_SKIP_FRAMES
-                    if self._stream_manager.is_streaming() and (self._frame_count % stream_skip == 0):
+                    if (self._stream_manager.is_streaming()
+                            and (self._frame_count % stream_skip == 0)
+                            and not self._is_recognize_frame):
                         self._stream_manager.write(img)
 
                     # 11. 短暂休眠（减少休眠时间以提高帧率）

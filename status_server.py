@@ -44,6 +44,15 @@ class StatusServer:
         "Connection: close\r\n"
     )
     _HTTP_404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    # CORS 预检（浏览器/部分客户端 POST 前会先发 OPTIONS）
+    _HTTP_CORS_PREFLIGHT = (
+        "HTTP/1.1 204 No Content\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n\r\n"
+    )
 
     def __init__(self, port=8001):
         """
@@ -66,6 +75,9 @@ class StatusServer:
         self._lock = _thread.allocate_lock()
         self._running = False
         self._server_socket = None
+
+        # 上位机下发的指令队列（HTTP 线程入队，主循环出队执行，保证线程安全）
+        self._cmd_queue = []
 
         # 预缓存的 JSON 响应体字节（仅在数据变化时重建）
         self._cached_body = b'{}'
@@ -147,6 +159,20 @@ class StatusServer:
         with self._lock:
             return self._status.copy()
 
+    def pop_command(self):
+        """
+        线程安全地取出一条上位机下发的指令（FIFO）。
+
+        由主循环每帧调用，没有指令时返回 None。
+
+        返回：
+            dict 指令负载（如 {"cmd": "start_recognize"}），或 None
+        """
+        with self._lock:
+            if self._cmd_queue:
+                return self._cmd_queue.pop(0)
+            return None
+
     def _serve(self):
         """
         HTTP 服务主循环（在独立线程中运行）
@@ -192,7 +218,7 @@ class StatusServer:
                     # 快速读取请求行（只关心第一行路径）
                     # 设置短超时防止慢客户端阻塞
                     client.settimeout(2.0)
-                    request = client.recv(256).decode('utf-8', errors='ignore')
+                    request = client.recv(1024).decode('utf-8', errors='ignore')
 
                     if request.startswith('GET /status'):
                         # 使用预缓存的 JSON 响应体，无需加锁
@@ -207,6 +233,15 @@ class StatusServer:
                         ).encode('utf-8') + body_bytes
 
                         client.sendall(response)
+
+                    elif request.startswith('OPTIONS'):
+                        # CORS 预检请求，直接回 204
+                        client.sendall(self._HTTP_CORS_PREFLIGHT.encode('utf-8'))
+
+                    elif request.startswith('POST /command'):
+                        # 解析下发指令并入队（执行交给主循环，保证线程安全）
+                        self._handle_command(client, request)
+
                     else:
                         client.sendall(self._HTTP_404.encode('utf-8'))
 
@@ -230,6 +265,69 @@ class StatusServer:
             pass
         self._server_socket = None
         print("[状态服务] 服务线程已退出")
+
+    def _handle_command(self, client, request):
+        """
+        处理 POST /command 请求：读取完整 body，解析 JSON，将指令入队。
+
+        指令的实际执行由主循环调用 pop_command() 取出后处理，
+        HTTP 线程只负责入队，避免跨线程操作状态机/摄像头导致崩溃。
+
+        参数：
+            client: 已连接的客户端 socket
+            request: 已读取的首段请求文本（含头部，可能含部分 body）
+        """
+        # 分离头部与已读到的 body 片段
+        sep = request.find('\r\n\r\n')
+        body = request[sep + 4:] if sep != -1 else ''
+
+        # 解析 Content-Length
+        content_length = 0
+        for line in request.split('\r\n'):
+            if line.lower().startswith('content-length:'):
+                try:
+                    content_length = int(line.split(':', 1)[1].strip())
+                except Exception:
+                    content_length = 0
+                break
+
+        # 继续读取直到 body 完整（按 UTF-8 字节数比较，兼容中文）
+        try:
+            while len(body.encode('utf-8')) < content_length:
+                chunk = client.recv(512).decode('utf-8', errors='ignore')
+                if not chunk:
+                    break
+                body += chunk
+        except Exception:
+            pass
+
+        # 解析 JSON 并入队
+        ok = False
+        msg = 'bad json'
+        try:
+            payload = json.loads(body) if body else {}
+            if isinstance(payload, dict) and payload.get('cmd'):
+                with self._lock:
+                    self._cmd_queue.append(payload)
+                ok = True
+                msg = 'queued'
+            else:
+                msg = 'missing cmd'
+        except Exception as e:
+            msg = 'bad json: {}'.format(e)
+
+        # 回响应（复用带 CORS 的 200 头）
+        resp_body = json.dumps(
+            {"ok": ok, "msg": msg}, ensure_ascii=False
+        ).encode('utf-8')
+        response = (
+            self._HTTP_OK_PREFIX +
+            "Content-Length: {}\r\n\r\n".format(len(resp_body))
+        ).encode('utf-8') + resp_body
+        try:
+            client.sendall(response)
+        except Exception:
+            pass
 
     def destroy(self):
         """

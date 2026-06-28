@@ -26,3 +26,39 @@
 [2026-06-11T07:58:30.837Z] [INFO] XAI client initialized {"defaultModel":"grok-4.20-multi-agent","baseURL":"https://api.x.ai/v1"}
 [2026-06-11T07:58:30.844Z] [INFO] Starting MCP server {"version":"1.0.0","xaiConfigured":true,"debugMode":true,"logDir":"logs"}
 [2026-06-11T07:58:30.845Z] [INFO] Server running and ready for connections
+[2026-06-11T10:44:04.945Z] [INFO] Logger initialized {"logDir":"logs","logFile":"logs\\mcp-xai.log","usageFile":"logs\\usage.jsonl"}
+[2026-06-11T10:44:05.075Z] [INFO] XAI client initialized {"defaultModel":"grok-4.20-multi-agent","baseURL":"https://api.x.ai/v1"}
+[2026-06-11T10:44:05.083Z] [INFO] Starting MCP server {"version":"1.0.0","xaiConfigured":true,"debugMode":true,"logDir":"logs"}
+[2026-06-11T10:44:05.083Z] [INFO] Server running and ready for connections
+[2026-06-11T13:49:49.424Z] [INFO] Logger initialized {"logDir":"logs","logFile":"logs\\mcp-xai.log","usageFile":"logs\\usage.jsonl"}
+[2026-06-11T13:49:50.212Z] [INFO] XAI client initialized {"defaultModel":"grok-4.20-multi-agent","baseURL":"https://api.x.ai/v1"}
+[2026-06-11T13:49:50.218Z] [INFO] Starting MCP server {"version":"1.0.0","xaiConfigured":true,"debugMode":true,"logDir":"logs"}
+[2026-06-11T13:49:50.219Z] [INFO] Server running and ready for connections
+[2026-06-11T13:52:51.318Z] [INFO] Logger initialized {"logDir":"logs","logFile":"logs\\mcp-xai.log","usageFile":"logs\\usage.jsonl"}
+[2026-06-11T13:52:51.420Z] [INFO] XAI client initialized {"defaultModel":"grok-4.20-multi-agent","baseURL":"https://api.x.ai/v1"}
+[2026-06-11T13:52:51.427Z] [INFO] Starting MCP server {"version":"1.0.0","xaiConfigured":true,"debugMode":true,"logDir":"logs"}
+[2026-06-11T13:52:51.428Z] [INFO] Server running and ready for connections
+[2026-06-24T11:14:04.254Z] [INFO] Logger initialized {"logDir":"logs","logFile":"logs\\mcp-xai.log","usageFile":"logs\\usage.jsonl"}
+[2026-06-24T11:14:04.348Z] [INFO] XAI client initialized {"defaultModel":"grok-4.20-multi-agent","baseURL":"https://api.x.ai/v1"}
+[2026-06-24T11:14:04.354Z] [INFO] Starting MCP server {"version":"1.0.0","xaiConfigured":true,"debugMode":true,"logDir":"logs"}
+[2026-06-24T11:14:04.355Z] [INFO] Server running and ready for connections
+[2026-06-24T13:17:51.660Z] [INFO] Logger initialized {"logDir":"logs","logFile":"logs\\mcp-xai.log","usageFile":"logs\\usage.jsonl"}
+[2026-06-24T13:17:51.769Z] [INFO] XAI client initialized {"defaultModel":"grok-4.20-multi-agent","baseURL":"https://api.x.ai/v1"}
+[2026-06-24T13:17:51.777Z] [INFO] Starting MCP server {"version":"1.0.0","xaiConfigured":true,"debugMode":true,"logDir":"logs"}
+[2026-06-24T13:17:51.778Z] [INFO] Server running and ready for connections
+[2026-06-24T13:26:16.749Z] [INFO] Logger initialized {"logDir":"logs","logFile":"logs\\mcp-xai.log","usageFile":"logs\\usage.jsonl"}
+[2026-06-24T13:26:16.857Z] [INFO] XAI client initialized {"defaultModel":"grok-4.20-multi-agent","baseURL":"https://api.x.ai/v1"}
+[2026-06-24T13:26:16.868Z] [INFO] Starting MCP server {"version":"1.0.0","xaiConfigured":true,"debugMode":true,"logDir":"logs"}
+[2026-06-24T13:26:16.868Z] [INFO] Server running and ready for connections
+[2026-06-24T13:47:14.947Z] [INFO] Logger initialized {"logDir":"logs","logFile":"logs\\mcp-xai.log","usageFile":"logs\\usage.jsonl"}
+[2026-06-24T13:47:15.060Z] [INFO] XAI client initialized {"defaultModel":"grok-4.20-multi-agent","baseURL":"https://api.x.ai/v1"}
+[2026-06-24T13:47:15.068Z] [INFO] Starting MCP server {"version":"1.0.0","xaiConfigured":true,"debugMode":true,"logDir":"logs"}
+[2026-06-24T13:47:15.069Z] [INFO] Server running and ready for connections
+[2026-06-24T14:42:15.968Z] [INFO] Logger initialized {"logDir":"logs","logFile":"logs\\mcp-xai.log","usageFile":"logs\\usage.jsonl"}
+[2026-06-24T14:42:16.123Z] [INFO] XAI client initialized {"defaultModel":"grok-4.20-multi-agent","baseURL":"https://api.x.ai/v1"}
+[2026-06-24T14:42:16.130Z] [INFO] Starting MCP server {"version":"1.0.0","xaiConfigured":true,"debugMode":true,"logDir":"logs"}
+[2026-06-24T14:42:16.131Z] [INFO] Server running and ready for connections
+[2026-06-25T08:22:44.250Z] [INFO] Logger initialized {"logDir":"logs","logFile":"logs\\mcp-xai.log","usageFile":"logs\\usage.jsonl"}
+[2026-06-25T08:22:45.045Z] [INFO] XAI client initialized {"defaultModel":"grok-4.20-multi-agent","baseURL":"https://api.x.ai/v1"}
+[2026-06-25T08:22:45.051Z] [INFO] Starting MCP server {"version":"1.0.0","xaiConfigured":true,"debugMode":true,"logDir":"logs"}
+[2026-06-25T08:22:45.052Z] [INFO] Server running and ready for connections
